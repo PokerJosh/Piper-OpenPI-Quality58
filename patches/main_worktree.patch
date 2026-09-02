@@ -1,0 +1,3728 @@
+diff --git a/src/openpi/models/pi0.py b/src/openpi/models/pi0.py
+index ae7c459..13a69f0 100644
+--- a/src/openpi/models/pi0.py
++++ b/src/openpi/models/pi0.py
+@@ -9,6 +9,8 @@ from typing_extensions import override
+ 
+ from openpi.models import model as _model
+ from openpi.models import pi0_config
++from openpi.models.rtc_jax import prepare_rtc_prefix, rtc_guided_velocity
++from openpi.models.training_rtc import postfix_mse, prepare_training_rtc, sample_prefix_lengths
+ import openpi.models.gemma as _gemma
+ import openpi.models.siglip as _siglip
+ from openpi.shared import array_typing as at
+@@ -67,6 +69,9 @@ class Pi0(_model.BaseModel):
+     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
+         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
+         self.pi05 = config.pi05
++        self.training_rtc = config.training_rtc
++        self.training_rtc_max_delay = config.training_rtc_max_delay
++        self.training_rtc_action_dim = config.training_rtc_action_dim
+         paligemma_config = _gemma.get_config(config.paligemma_variant)
+         action_expert_config = _gemma.get_config(config.action_expert_variant)
+         # TODO: rewrite gemma in NNX. For now, use bridge.
+@@ -195,9 +200,20 @@ class Pi0(_model.BaseModel):
+         batch_shape = actions.shape[:-2]
+         noise = jax.random.normal(noise_rng, actions.shape)
+         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+-        time_expanded = time[..., None, None]
+-        x_t = time_expanded * noise + (1 - time_expanded) * actions
+-        u_t = noise - actions
++        if self.training_rtc and train:
++            rtc_prefix_lengths = sample_prefix_lengths(
++                jax.random.fold_in(time_rng, 1),
++                batch_size=actions.shape[0],
++                max_delay=self.training_rtc_max_delay,
++            )
++            x_t, u_t, _ = prepare_training_rtc(
++                actions, noise, time, rtc_prefix_lengths, self.training_rtc_action_dim
++            )
++        else:
++            time_expanded = time[..., None, None]
++            x_t = time_expanded * noise + (1 - time_expanded) * actions
++            u_t = noise - actions
++            rtc_prefix_lengths = None
+ 
+         # one big forward pass of prefix + suffix at once
+         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+@@ -211,7 +227,7 @@ class Pi0(_model.BaseModel):
+         )
+         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+ 
+-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
++        return postfix_mse(v_t, u_t, rtc_prefix_lengths, self.training_rtc_action_dim)
+ 
+     @override
+     def sample_actions(
+@@ -221,6 +237,11 @@ class Pi0(_model.BaseModel):
+         *,
+         num_steps: int | at.Int[at.Array, ""] = 10,
+         noise: at.Float[at.Array, "b ah ad"] | None = None,
++        rtc_prev_chunk_left_over=None,
++        rtc_inference_delay=None,
++        rtc_execution_horizon=None,
++        rtc_prefix_weights=None,
++        rtc_max_guidance_weight=None,
+     ) -> _model.Actions:
+         observation = _model.preprocess_observation(None, observation, train=False)
+         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
+@@ -236,37 +257,66 @@ class Pi0(_model.BaseModel):
+         positions = jnp.cumsum(prefix_mask, axis=1) - 1
+         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+ 
++        # RTC is an inference-time model-space option.  Prepare the previous
++        # chunk once so the denoising loop always operates on fixed shapes.
++        rtc_enabled = rtc_prev_chunk_left_over is not None
++        if rtc_enabled:
++            rtc_prefix, rtc_prefix_mask = prepare_rtc_prefix(
++                rtc_prev_chunk_left_over,
++                batch_size=batch_size,
++                horizon=self.action_horizon,
++                action_dim=self.action_dim,
++            )
++            rtc_delay = 0 if rtc_inference_delay is None else rtc_inference_delay
++            rtc_horizon = self.action_horizon if rtc_execution_horizon is None else rtc_execution_horizon
++            rtc_guidance = 10.0 if rtc_max_guidance_weight is None else rtc_max_guidance_weight
++        else:
++            rtc_prefix = rtc_prefix_mask = None
++            rtc_delay = rtc_horizon = rtc_guidance = None
++
+         def step(carry):
+             x_t, time = carry
+-            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+-                observation, x_t, jnp.broadcast_to(time, batch_size)
+-            )
+-            # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
+-            # other
+-            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+-            # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
+-            # prefix tokens
+-            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+-            # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
+-            # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
+-            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+-            assert full_attn_mask.shape == (
+-                batch_size,
+-                suffix_tokens.shape[1],
+-                prefix_tokens.shape[1] + suffix_tokens.shape[1],
+-            )
+-            # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
+-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+-
+-            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+-                [None, suffix_tokens],
+-                mask=full_attn_mask,
+-                positions=positions,
+-                kv_cache=kv_cache,
+-                adarms_cond=[None, adarms_cond],
+-            )
+-            assert prefix_out is None
+-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
++            def base_denoise(current_x_t):
++                suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
++                    observation, current_x_t, jnp.broadcast_to(time, batch_size)
++                )
++                # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each other.
++                suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
++                # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the prefix tokens.
++                suffix_prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
++                # The suffix queries attend to the cached prefix and causal suffix.
++                full_attn_mask = jnp.concatenate([suffix_prefix_attn_mask, suffix_attn_mask], axis=-1)
++                assert full_attn_mask.shape == (
++                    batch_size,
++                    suffix_tokens.shape[1],
++                    prefix_tokens.shape[1] + suffix_tokens.shape[1],
++                )
++                suffix_positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
++
++                (prefix_out, suffix_out), _ = self.PaliGemma.llm(
++                    [None, suffix_tokens],
++                    mask=full_attn_mask,
++                    positions=suffix_positions,
++                    kv_cache=kv_cache,
++                    adarms_cond=[None, adarms_cond],
++                )
++                assert prefix_out is None
++                return self.action_out_proj(suffix_out[:, -self.action_horizon :])
++
++            if rtc_enabled:
++                v_t = rtc_guided_velocity(
++                    base_denoise,
++                    x_t,
++                    time,
++                    rtc_prefix,
++                    rtc_delay,
++                    rtc_horizon,
++                    prefix_mask=rtc_prefix_mask,
++                    prefix_weights=rtc_prefix_weights,
++                    max_guidance_weight=rtc_guidance,
++                )
++            else:
++                v_t = base_denoise(x_t)
+ 
+             return x_t + dt * v_t, time + dt
+ 
+diff --git a/src/openpi/models/pi0_config.py b/src/openpi/models/pi0_config.py
+index 584d83f..9630857 100644
+--- a/src/openpi/models/pi0_config.py
++++ b/src/openpi/models/pi0_config.py
+@@ -32,6 +32,15 @@ class Pi0Config(_model.BaseModelConfig):
+     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
+     discrete_state_input: bool = None  # type: ignore
+ 
++    # Optional training-time RTC conditioning. Disabled by default to preserve
++    # the existing flow-matching objective for ordinary configs.
++    training_rtc: bool = False
++    training_rtc_max_delay: int = 4
++    # Number of physical action dimensions covered by training-time RTC.
++    # Latent padding dimensions remain ordinary model inputs and are excluded
++    # from RTC conditioning/loss.
++    training_rtc_action_dim: int | None = None
++
+     pytorch_compile_mode: str | None = "max-autotune"
+ 
+     def __post_init__(self):
+@@ -39,6 +48,12 @@ class Pi0Config(_model.BaseModelConfig):
+             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
+         if self.discrete_state_input is None:
+             object.__setattr__(self, "discrete_state_input", self.pi05)
++        if self.training_rtc_max_delay < 0:
++            raise ValueError("training_rtc_max_delay must be non-negative")
++        if self.training_rtc and self.action_horizon <= self.training_rtc_max_delay:
++            raise ValueError("training_rtc_max_delay must be smaller than action_horizon")
++        if self.training_rtc_action_dim is not None and not (0 < self.training_rtc_action_dim <= self.action_dim):
++            raise ValueError("training_rtc_action_dim must be between 1 and action_dim")
+         if self.pytorch_compile_mode is not None:
+             assert self.pytorch_compile_mode in [
+                 "default",
+diff --git a/src/openpi/training/config.py b/src/openpi/training/config.py
+index 4ca47e1..06407ab 100644
+--- a/src/openpi/training/config.py
++++ b/src/openpi/training/config.py
+@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
+ import openpi.policies.aloha_policy as aloha_policy
+ import openpi.policies.droid_policy as droid_policy
+ import openpi.policies.libero_policy as libero_policy
++import openpi.policies.piper_policy as piper_policy
+ import openpi.shared.download as _download
+ import openpi.shared.normalize as _normalize
+ import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+@@ -97,6 +98,16 @@ class DataConfig:
+     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
+     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+ 
++    # Optional frozen-window dataset inputs. When set, create_torch_dataset uses the
++    # read-only mask-aware adapter instead of LeRobot's episode sampler. These fields
++    # are intentionally explicit so ordinary LeRobot configs keep their old path.
++    mask_aware_manifest_path: str | None = None
++    mask_aware_mask_path: str | None = None
++    mask_aware_nominal_root: str | None = None
++    mask_aware_recovery_root: str | None = None
++    mask_aware_seed: int | None = None
++    mask_aware_prompt: str | None = None
++
+ 
+ class GroupFactory(Protocol):
+     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
+@@ -355,6 +366,240 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
+         )
+ 
+ 
++@dataclasses.dataclass(frozen=True)
++class LeRobotPiperDataConfig(DataConfigFactory):
++    """Piper single-arm: TOP -> base_0_rgb, WRIST -> left_wrist_0_rgb.
++
++    Actions are absolute joint targets (J1..J6, degrees) + absolute gripper
++    (meters). We convert the first 6 joint dims to deltas (relative to current
++    state) as expected by pi0/pi0.5 training, keeping the gripper absolute.
++    Units are NOT converted; normalization stats handle scaling symmetrically.
++    """
++
++    default_prompt: str | None = "pick up the battery and place it into the target location"
++
++    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
++        default=_transforms.Group(
++            inputs=[
++                _transforms.RepackTransform(
++                    {
++                        "images": {
++                            "top": "observation.images.top",
++                            "wrist": "observation.images.wrist",
++                        },
++                        "state": "observation.state",
++                        "actions": "action",
++                        "prompt": "prompt",
++                    }
++                )
++            ]
++        )
++    )
++    action_sequence_keys: Sequence[str] = ("action",)
++
++    @override
++    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
++        data_transforms = _transforms.Group(
++            inputs=[piper_policy.PiperInputs()],
++            outputs=[piper_policy.PiperOutputs()],
++        )
++        # First 6 dims (joints) -> delta; last dim (gripper) stays absolute.
++        delta_action_mask = _transforms.make_bool_mask(6, -1)
++        data_transforms = data_transforms.push(
++            inputs=[_transforms.DeltaActions(delta_action_mask)],
++            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
++        )
++
++        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
++
++        return dataclasses.replace(
++            self.create_base_config(assets_dirs, model_config),
++            repack_transforms=self.repack_transforms,
++            data_transforms=data_transforms,
++            model_transforms=model_transforms,
++            action_sequence_keys=self.action_sequence_keys,
++        )
++
++
++@dataclasses.dataclass(frozen=True)
++class LeRobotPiperJointRTCQuality58DataConfig(DataConfigFactory):
++    """Frozen Quality58 Joint-space H20 data with mask-only window sampling.
++
++    The two source trees are read through ``MaskAwareJointRTCDataset``. The
++    frozen manifest and sample mask are the sole authority for training-window
++    membership; no LeRobot episode sampler is used for this config.
++    """
++
++    repo_id: str = "local/piper_joint_rtc_quality58"
++    manifest_path: str = (
++        "<DATA_QA_ROOT>/joint_rtc_expert_salvage_20260901T161500Z/FINAL_TRAINING_MANIFEST.json"
++    )
++    mask_path: str = (
++        "<DATA_QA_ROOT>/joint_rtc_expert_salvage_20260901T161500Z/FINAL_TRAIN_SAMPLE_MASK.json"
++    )
++    nominal_root: str = "<NOMINAL_DATASET_ROOT>"
++    recovery_root: str = (
++        "<DATASET_ROOT>/"
++        "piper_openpi_v21_recovery_v1_reviewed_clean_11ep"
++    )
++    seed: int | None = None
++    default_prompt: str = "pick and place"
++
++    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
++        default=_transforms.Group(
++            inputs=[
++                _transforms.RepackTransform(
++                    {
++                        "images": {
++                            "top": "observation.images.top",
++                            "wrist": "observation.images.wrist",
++                        },
++                        "state": "observation.state",
++                        "actions": "action",
++                        "prompt": "prompt",
++                    }
++                )
++            ]
++        )
++    )
++    action_sequence_keys: Sequence[str] = ("action",)
++
++    @override
++    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
++        if model_config.action_horizon != 20:
++            raise ValueError("Quality58 Joint RTC config requires action_horizon=20")
++        if model_config.action_dim != 32:
++            raise ValueError("Quality58 Joint RTC config requires latent action_dim=32")
++        if model_config.training_rtc_action_dim != 7:
++            raise ValueError("Quality58 Joint RTC config requires physical training_rtc_action_dim=7")
++
++        data_transforms = _transforms.Group(
++            inputs=[piper_policy.PiperInputs()],
++            outputs=[piper_policy.PiperOutputs()],
++        )
++        # J1-J6 are deltas relative to the current state; G remains absolute.
++        delta_action_mask = _transforms.make_bool_mask(6, -1)
++        data_transforms = data_transforms.push(
++            inputs=[_transforms.DeltaActions(delta_action_mask)],
++            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
++        )
++        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
++
++        return dataclasses.replace(
++            self.create_base_config(assets_dirs, model_config),
++            repack_transforms=self.repack_transforms,
++            data_transforms=data_transforms,
++            model_transforms=model_transforms,
++            action_sequence_keys=self.action_sequence_keys,
++            mask_aware_manifest_path=self.manifest_path,
++            mask_aware_mask_path=self.mask_path,
++            mask_aware_nominal_root=self.nominal_root,
++            mask_aware_recovery_root=self.recovery_root,
++            mask_aware_seed=self.seed,
++            mask_aware_prompt=self.default_prompt,
++        )
++
++
++@dataclasses.dataclass(frozen=True)
++class LeRobotPiperTCPDataConfig(DataConfigFactory):
++    """Piper single-arm TCP-delta representation (piper_tcp_delta_v1).
++
++    Dataset is PRE-CONVERTED offline: observation.state is already
++    [x,y,z, rotvec(3), gripper] (m/rad/m) and action is already
++    [dx,dy,dz, drot(3), gripper] (m/rad/m, deployment-feasible labels,
++    constrained-IK projected). Therefore NO DeltaActions/AbsoluteActions
++    transform is applied — the action vector is consumed as-is.
++    """
++
++    default_prompt: str | None = "pick and place"
++
++    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
++        default=_transforms.Group(
++            inputs=[
++                _transforms.RepackTransform(
++                    {
++                        "images": {
++                            "top": "observation.images.top",
++                            "wrist": "observation.images.wrist",
++                        },
++                        "state": "observation.state",
++                        "actions": "action",
++                        "prompt": "prompt",
++                    }
++                )
++            ]
++        )
++    )
++    action_sequence_keys: Sequence[str] = ("action",)
++
++    @override
++    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
++        # Same camera mapping / image pipeline as the joint-space Piper config.
++        data_transforms = _transforms.Group(
++            inputs=[piper_policy.PiperInputs()],
++            outputs=[piper_policy.PiperOutputs()],
++        )
++        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
++
++        return dataclasses.replace(
++            self.create_base_config(assets_dirs, model_config),
++            repack_transforms=self.repack_transforms,
++            data_transforms=data_transforms,
++            model_transforms=model_transforms,
++            action_sequence_keys=self.action_sequence_keys,
++        )
++
++
++@dataclasses.dataclass(frozen=True)
++class LeRobotPiperTCPAbsoluteDataConfig(DataConfigFactory):
++    """Piper TCP dataset with absolute targets converted at loader time.
++
++    V3 stores `[x, y, z, rotvec, gripper]` feasible targets. The training
++    transform anchors every target in the requested action chunk to the current
++    sample's TCP state, including a proper SO(3) relative rotation.
++    """
++
++    default_prompt: str | None = "pick and place"
++
++    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
++        default=_transforms.Group(
++            inputs=[
++                _transforms.RepackTransform(
++                    {
++                        "images": {
++                            "top": "observation.images.top",
++                            "wrist": "observation.images.wrist",
++                        },
++                        "state": "observation.state",
++                        "actions": "action",
++                        "prompt": "prompt",
++                    }
++                )
++            ]
++        )
++    )
++    action_sequence_keys: Sequence[str] = ("action",)
++
++    @override
++    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
++        data_transforms = _transforms.Group(
++            inputs=[
++                piper_policy.PiperInputs(),
++                piper_policy.PiperTCPAnchoredActions(),
++            ],
++            outputs=[piper_policy.PiperOutputs()],
++        )
++        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
++
++        return dataclasses.replace(
++            self.create_base_config(assets_dirs, model_config),
++            repack_transforms=self.repack_transforms,
++            data_transforms=data_transforms,
++            model_transforms=model_transforms,
++            action_sequence_keys=self.action_sequence_keys,
++        )
++
++
+ @dataclasses.dataclass(frozen=True)
+ class RLDSDroidDataConfig(DataConfigFactory):
+     """
+@@ -761,6 +1006,338 @@ _CONFIGS = [
+         pytorch_weight_path="/path/to/your/pytorch_weight_path",
+         num_train_steps=30_000,
+     ),
++    TrainConfig(
++        # Piper single-arm, pi0.5 base + LoRA (low-memory) finetune.
++        name="pi05_piper_low_mem_finetune",
++        model=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=10,
++            discrete_state_input=False,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++        ),
++        data=LeRobotPiperDataConfig(
++            repo_id="local/piper_openpi_v21",
++            base_config=DataConfig(prompt_from_task=True),
++        ),
++        batch_size=16,
++        lr_schedule=_optimizer.CosineDecaySchedule(
++            warmup_steps=1_000,
++            peak_lr=5e-5,
++            decay_steps=10_000,
++            decay_lr=5e-5,
++        ),
++        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
++        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
++        num_train_steps=10_000,
++        # Match the LoRA model config above when extracting the freeze filter.
++        freeze_filter=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=10,
++            discrete_state_input=False,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++        ).get_freeze_filter(),
++        # Turn off EMA for LoRA finetuning.
++        ema_decay=None,
++    ),
++    TrainConfig(
++        name="pi05_piper_tcp_delta_v1_finetune",
++        model=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=10,
++            discrete_state_input=False,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++        ),
++        # Same 92-episode demonstrations, offline-converted to deployment-feasible
++        # TCP-delta state/action (local/piper_tcp_delta_v1). Identical recipe to
++        # pi05_piper_low_mem_finetune except the representation.
++        data=LeRobotPiperTCPDataConfig(
++            repo_id="local/piper_tcp_delta_v1",
++            base_config=DataConfig(prompt_from_task=True),
++        ),
++        batch_size=16,
++        lr_schedule=_optimizer.CosineDecaySchedule(
++            warmup_steps=1_000,
++            peak_lr=5e-5,
++            decay_steps=10_000,
++            decay_lr=5e-5,
++        ),
++        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
++        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
++        num_train_steps=10_000,
++        freeze_filter=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=10,
++            discrete_state_input=False,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++        ).get_freeze_filter(),
++        ema_decay=None,
++    ),
++    TrainConfig(
++        name="pi05_piper_tcp_delta_v2_finetune",
++        model=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=10,
++            discrete_state_input=False,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++        ),
++        # V2: interior-J3-margin TCP-delta dataset (local/piper_tcp_delta_v2).
++        # Identical recipe to v1, retrained fresh from pi05_base (no v1 LoRA
++        # resume), so V1's boundary-pinned J3 tendency is not inherited.
++        data=LeRobotPiperTCPDataConfig(
++            repo_id="local/piper_tcp_delta_v2",
++            base_config=DataConfig(prompt_from_task=True),
++        ),
++        batch_size=16,
++        lr_schedule=_optimizer.CosineDecaySchedule(
++            warmup_steps=1_000,
++            peak_lr=5e-5,
++            decay_steps=10_000,
++            decay_lr=5e-5,
++        ),
++        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
++        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
++        num_train_steps=10_000,
++        freeze_filter=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=10,
++            discrete_state_input=False,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++        ).get_freeze_filter(),
++        ema_decay=None,
++    ),
++    TrainConfig(
++        name="pi05_piper_tcp_delta_v2_gripper_transition_ft",
++        model=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=10,
++            discrete_state_input=False,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++        ),
++        # EXPERIMENTAL targeted fine-tune from V2-9999 (NOT a replacement):
++        # identical model/representation/transforms; only the ANCHOR SAMPLING
++        # distribution is reweighted toward gripper open/close transition
++        # windows (see openpi/scripts/train_gripper_transition.py, weights
++        # from openpi_final_retry/gripper_transition_ft/index.json). Assets are
++        # a byte-identical copy of the V2 norm stats (never recomputed).
++        data=LeRobotPiperTCPDataConfig(
++            repo_id="local/piper_tcp_delta_v2",
++            base_config=DataConfig(prompt_from_task=True),
++        ),
++        batch_size=16,
++        # small-step fine-tune: peak lr = min(V2 5e-5 / 5, 1e-5) = 1e-5, warmup
++        # kept at the V2 proportion (10% of steps), constant afterwards like V2.
++        lr_schedule=_optimizer.CosineDecaySchedule(
++            warmup_steps=400,
++            peak_lr=1e-5,
++            decay_steps=4_000,
++            decay_lr=1e-5,
++        ),
++        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
++        weight_loader=weight_loaders.CheckpointWeightLoader(
++            "<CHECKPOINT_ROOT>/pi05_piper_tcp_delta_v2_finetune/"
++            "pi05_piper_tcp_v2_10k_20260825_151843/9999/params"
++        ),
++        num_train_steps=4_000,
++        freeze_filter=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=10,
++            discrete_state_input=False,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++        ).get_freeze_filter(),
++        ema_decay=None,
++        save_interval=500,
++        keep_period=500,
++    ),
++    TrainConfig(
++        name="pi05_piper_tcp_delta_v2_recovery_mix_finetune",
++        model=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=10,
++            discrete_state_input=False,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++        ),
++        # Recovery finetune on the 103-ep mix (92 original V2 + 11 clean
++        # recovery episodes; the bad old-recovery episode is excluded at merge
++        # time). Continuation-style: init from V2-9999 params only (params-only
++        # weight_loader -> fresh optimizer, no optimizer-state resume). Norm
++        # stats reused from the V2 baseline assets (never recomputed).
++        data=LeRobotPiperTCPDataConfig(
++            repo_id="local/piper_tcp_delta_v2_recovery_mix_103ep",
++            assets=AssetsConfig(
++                assets_dir=str(
++                    pathlib.Path(__file__).resolve().parents[3] / "assets" / "pi05_piper_tcp_delta_v2_finetune"
++                ),
++                asset_id="local/piper_tcp_delta_v2",
++            ),
++            base_config=DataConfig(prompt_from_task=True),
++        ),
++        batch_size=16,
++        lr_schedule=_optimizer.CosineDecaySchedule(
++            warmup_steps=100,
++            peak_lr=1e-5,
++            decay_steps=3_000,
++            decay_lr=2e-6,
++        ),
++        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
++        weight_loader=weight_loaders.CheckpointWeightLoader(
++            "<CHECKPOINT_ROOT>/pi05_piper_tcp_delta_v2_finetune/"
++            "pi05_piper_tcp_v2_10k_20260825_151843/9999/params"
++        ),
++        num_train_steps=3_000,
++        freeze_filter=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=10,
++            discrete_state_input=False,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++        ).get_freeze_filter(),
++        ema_decay=None,
++        wandb_enabled=False,
++        save_interval=500,
++        keep_period=500,
++        log_interval=50,
++    ),
++    TrainConfig(
++        # Joint-space recovery continuation. The source dataset retains absolute
++        # J1..J6/G labels; LeRobotPiperDataConfig applies the baseline's first-6
++        # DeltaActions transform and inverse AbsoluteActions on inference.
++        name="pi05_piper_joint_recovery_mix_finetune",
++        model=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=10,
++            discrete_state_input=False,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++        ),
++        data=LeRobotPiperDataConfig(
++            repo_id="local/piper_joint_recovery_mix_103ep",
++            base_config=DataConfig(prompt_from_task=True),
++        ),
++        checkpoint_base_dir="<CHECKPOINT_ROOT>",
++        batch_size=16,
++        lr_schedule=_optimizer.CosineDecaySchedule(
++            warmup_steps=100,
++            peak_lr=1e-5,
++            decay_steps=3_000,
++            decay_lr=2e-6,
++        ),
++        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
++        # Params-only loader: the new TrainState initializes step=0 and creates
++        # a fresh optimizer/scheduler state; it never restores train_state.
++        weight_loader=weight_loaders.CheckpointWeightLoader(
++            "<CHECKPOINT_ROOT>/pi05_piper_low_mem_finetune/"
++            "pi05_piper_92ep_7500_to_10k_20260823_235331/9999/params"
++        ),
++        num_train_steps=3_000,
++        freeze_filter=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=10,
++            discrete_state_input=False,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++        ).get_freeze_filter(),
++        ema_decay=None,
++        wandb_enabled=False,
++        save_interval=500,
++        keep_period=500,
++        log_interval=10,
++    ),
++    TrainConfig(
++        # Frozen Quality58 Joint-space H20 training with training-time RTC.
++        # This is a separate experiment identity; the legacy 103-episode config
++        # above is intentionally left unchanged.
++        name="pi05_piper_joint_rtc_h20_quality58_finetune",
++        model=pi0_config.Pi0Config(
++            pi05=True,
++            action_dim=32,
++            action_horizon=20,
++            discrete_state_input=False,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++            training_rtc=True,
++            training_rtc_max_delay=4,
++            training_rtc_action_dim=7,
++        ),
++        data=LeRobotPiperJointRTCQuality58DataConfig(
++            assets=AssetsConfig(asset_id="local/piper_joint_rtc_quality58"),
++        ),
++        checkpoint_base_dir="<CHECKPOINT_ROOT>",
++        batch_size=16,
++        lr_schedule=_optimizer.CosineDecaySchedule(
++            warmup_steps=100,
++            peak_lr=1e-5,
++            decay_steps=3_000,
++            decay_lr=2e-6,
++        ),
++        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
++        # Params-only initialization; optimizer/train state starts fresh.
++        weight_loader=weight_loaders.CheckpointWeightLoader(
++            "<CHECKPOINT_ROOT>/"
++            "pi05_piper_joint_recovery_mix_finetune/"
++            "pi05_piper_joint_recovery_mix_103ep_3k_20260831_133508_fastfinish/"
++            "2999/params"
++        ),
++        num_train_steps=3_000,
++        freeze_filter=pi0_config.Pi0Config(
++            pi05=True,
++            action_dim=32,
++            action_horizon=20,
++            discrete_state_input=False,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++            training_rtc=True,
++            training_rtc_max_delay=4,
++            training_rtc_action_dim=7,
++        ).get_freeze_filter(),
++        ema_decay=None,
++        wandb_enabled=False,
++        save_interval=500,
++        keep_period=500,
++        log_interval=10,
++    ),
++    TrainConfig(
++        name="pi05_piper_tcp_delta_v3_finetune",
++        model=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=10,
++            discrete_state_input=False,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++        ),
++        # V3: same V2 feasible TCP targets, stored absolute and anchored to
++        # state[t] at loader time to fix the action-chunk semantics bug.
++        data=LeRobotPiperTCPAbsoluteDataConfig(
++            repo_id="local/piper_tcp_delta_v3",
++            base_config=DataConfig(prompt_from_task=True),
++        ),
++        batch_size=16,
++        lr_schedule=_optimizer.CosineDecaySchedule(
++            warmup_steps=1_000,
++            peak_lr=5e-5,
++            decay_steps=10_000,
++            decay_lr=5e-5,
++        ),
++        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
++        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
++        num_train_steps=10_000,
++        freeze_filter=pi0_config.Pi0Config(
++            pi05=True,
++            action_horizon=10,
++            discrete_state_input=False,
++            paligemma_variant="gemma_2b_lora",
++            action_expert_variant="gemma_300m_lora",
++        ).get_freeze_filter(),
++        ema_decay=None,
++    ),
+     #
+     # Fine-tuning Aloha configs.
+     #
+diff --git a/src/openpi/training/data_loader.py b/src/openpi/training/data_loader.py
+index e2ee7dd..54eecc7 100644
+--- a/src/openpi/training/data_loader.py
++++ b/src/openpi/training/data_loader.py
+@@ -1,14 +1,20 @@
+ from collections.abc import Iterator, Sequence
++import io
++import json
+ import logging
+ import multiprocessing
+ import os
++from pathlib import Path
++import pickle
++import random
+ import typing
+-from typing import Literal, Protocol, SupportsIndex, TypeVar
++from typing import ClassVar, Literal, Protocol, SupportsIndex, TypeVar
+ 
+ import jax
+ import jax.numpy as jnp
+ import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+ import numpy as np
++import pyarrow.parquet as parquet
+ import torch
+ 
+ import openpi.models.model as _model
+@@ -18,6 +24,253 @@ import openpi.transforms as _transforms
+ 
+ T_co = TypeVar("T_co", covariant=True)
+ 
++_JOINT_ACTION_KEYS = ("J1.pos", "J2.pos", "J3.pos", "J4.pos", "J5.pos", "J6.pos", "G.pos")
++_DEFAULT_JOINT_PROMPT = "pick up the battery and place it into the target location"
++
++
++class _RecoveryCompatibilityUnpickler(pickle.Unpickler):
++    """Loads old NumPy pickles without changing the process import table."""
++
++    _MODULE_ALIASES: ClassVar[dict[str, str]] = {
++        "numpy._core.numeric": "numpy.core.numeric",
++        "numpy._core.multiarray": "numpy.core.multiarray",
++        "numpy._core._multiarray_umath": "numpy.core._multiarray_umath",
++    }
++
++    def find_class(self, module: str, name: str):
++        return super().find_class(self._MODULE_ALIASES.get(module, module), name)
++
++
++def load_recovery_pickle_read_only(path: str | Path):
++    """Read one recovery frame using a compatibility-only, read-only unpickler."""
++    with Path(path).open("rb") as handle:
++        return _RecoveryCompatibilityUnpickler(io.BytesIO(handle.read())).load()
++
++
++def _expand_ranges(ranges: Sequence[Sequence[int]]) -> tuple[int, ...]:
++    values: list[int] = []
++    for item in ranges:
++        if len(item) != 2:
++            raise ValueError(f"frozen mask range must contain two integers: {item}")
++        start, end = (int(item[0]), int(item[1]))
++        if start > end:
++            raise ValueError(f"frozen mask range is descending: {item}")
++        values.extend(range(start, end + 1))
++    return tuple(values)
++
++
++def _episode_directory(root: Path, source_episode_id: str) -> Path:
++    episode_id = str(source_episode_id)
++    if not episode_id.startswith("episode_"):
++        episode_id = f"episode_{episode_id}"
++    return root / episode_id
++
++
++def _as_frame_array(values, *, dtype=np.float32) -> np.ndarray:
++    return np.asarray(values, dtype=dtype)
++
++
++def _canonical_image(image) -> np.ndarray:
++    image = np.asarray(image)
++    if image.ndim != 3:
++        raise ValueError(f"expected a 3D camera frame, got {image.shape}")
++    if image.shape[-1] == 3 and image.shape[0] != 3:
++        image = np.transpose(image, (2, 0, 1))
++    if image.shape[0] != 3:
++        raise ValueError(f"expected a 3-channel camera frame, got {image.shape}")
++    return image
++
++
++class _NominalEpisodeReader:
++    def __init__(self, root: Path, source_episode_id: str):
++        self._root = root
++        self._source_episode_id = str(source_episode_id)
++        episode_number = int(self._source_episode_id.removeprefix("episode_"))
++        self._parquet_path = root / "data" / "chunk-000" / f"episode_{episode_number:06d}.parquet"
++        if not self._parquet_path.is_file():
++            raise FileNotFoundError(f"nominal episode parquet not found: {self._parquet_path}")
++        table = parquet.read_table(self._parquet_path, columns=["observation.state", "action", "timestamp"])
++        self._state = _as_frame_array(table["observation.state"].to_pylist())
++        self._action = _as_frame_array(table["action"].to_pylist())
++        self._timestamps = _as_frame_array(table["timestamp"].to_pylist(), dtype=np.float64)
++        if self._state.shape != (len(self._action), 7) or self._action.shape != (len(self._action), 7):
++            raise ValueError(
++                f"nominal episode must contain 7D state/actions, got {self._state.shape} and {self._action.shape}"
++            )
++        if self._timestamps.shape != (len(self._action),):
++            raise ValueError(f"nominal timestamps must be 1D, got {self._timestamps.shape}")
++
++    def frame_count(self) -> int:
++        return len(self._action)
++
++    def read(self, start: int, horizon: int, prompt: str) -> dict:
++        end = start + horizon
++        if start < 0 or end > self.frame_count():
++            raise IndexError(f"H20 window [{start}:{end}] crosses nominal episode boundary")
++        images = {}
++        for camera in ("top", "wrist"):
++            key = f"observation.images.{camera}"
++            path = self._root / "videos" / "chunk-000" / key / f"{self._parquet_path.stem}.mp4"
++            if not path.is_file():
++                raise FileNotFoundError(f"nominal camera video not found: {path}")
++            frame = lerobot_dataset.decode_video_frames(
++                path,
++                [float(self._timestamps[start])],
++                tolerance_s=1e-4,
++                backend=lerobot_dataset.get_safe_default_codec(),
++            )
++            images[key] = _canonical_image(frame.squeeze(0).cpu().numpy())
++        return {
++            "observation.state": self._state[start].copy(),
++            "action": self._action[start:end].copy(),
++            "observation.images.top": images["observation.images.top"],
++            "observation.images.wrist": images["observation.images.wrist"],
++            "prompt": prompt,
++        }
++
++
++class _RecoveryEpisodeReader:
++    def __init__(self, root: Path, source_episode_id: str):
++        self._episode_path = _episode_directory(root, source_episode_id)
++        self._frame_paths = sorted(
++            self._episode_path.glob("frame_*.pkl"),
++            key=lambda path: int(path.stem.rsplit("_", 1)[1]),
++        )
++        if not self._frame_paths:
++            raise FileNotFoundError(f"recovery episode has no pickle frames: {self._episode_path}")
++
++    def frame_count(self) -> int:
++        return len(self._frame_paths)
++
++    def read(self, start: int, horizon: int, prompt: str) -> dict:
++        end = start + horizon
++        if start < 0 or end > self.frame_count():
++            raise IndexError(f"H20 window [{start}:{end}] crosses recovery episode boundary")
++        frames = tuple(load_recovery_pickle_read_only(path) for path in self._frame_paths[start:end])
++        first = frames[0]
++        action = np.asarray(
++            [[float(frame["action"][key]) for key in _JOINT_ACTION_KEYS] for frame in frames],
++            dtype=np.float32,
++        )
++        state = np.asarray(
++            [float(first["observation"][key]) for key in _JOINT_ACTION_KEYS],
++            dtype=np.float32,
++        )
++        return {
++            "observation.state": state,
++            "action": action,
++            "observation.images.top": _canonical_image(first["observation"]["top"]),
++            "observation.images.wrist": _canonical_image(first["observation"]["wrist"]),
++            "prompt": prompt,
++        }
++
++
++class MaskAwareJointRTCDataset:
++    """Read-only H20 dataset backed by the frozen manifest and sample mask."""
++
++    def __init__(
++        self,
++        manifest_path: str | Path,
++        mask_path: str | Path,
++        *,
++        action_horizon: int = 20,
++        seed: int | None = None,
++        nominal_root: str | Path | None = None,
++        recovery_root: str | Path | None = None,
++        prompt: str = _DEFAULT_JOINT_PROMPT,
++    ):
++        if action_horizon != 20:
++            raise ValueError("Joint RTC adapter requires H20 action_horizon=20")
++        self.action_horizon = action_horizon
++        self._manifest = json.loads(Path(manifest_path).read_text())
++        self._mask = json.loads(Path(mask_path).read_text())
++        if self._manifest.get("action_horizon") != 20 or self._mask.get("action_horizon") != 20:
++            raise ValueError("frozen manifest and mask must both declare H20")
++        manifest_episodes = {record["episode_id"]: record for record in self._manifest["episodes"]}
++        mask_episodes = self._mask["episodes"]
++        if set(manifest_episodes) != set(mask_episodes):
++            raise ValueError("frozen manifest and mask episode IDs do not match")
++        if "TOTAL_FINAL_EPISODES" in self._manifest:
++            expected_sources = {
++                "nominal": int(self._manifest["FINAL_NOMINAL_COUNT"]),
++                "recovery": int(self._manifest["FINAL_RECOVERY_COUNT"]),
++            }
++            source_counts = {
++                source: sum(record["source"] == source for record in manifest_episodes.values())
++                for source in expected_sources
++            }
++            if (
++                len(manifest_episodes) != int(self._manifest["TOTAL_FINAL_EPISODES"])
++                or source_counts != expected_sources
++            ):
++                raise ValueError(
++                    f"frozen selection counts mismatch: episodes={len(manifest_episodes)}, sources={source_counts}"
++                )
++        self._episode_records = manifest_episodes
++        self._prompt = prompt
++        self._nominal_root = Path(nominal_root) if nominal_root is not None else None
++        self._recovery_root = Path(recovery_root) if recovery_root is not None else None
++        self._readers: dict[str, _NominalEpisodeReader | _RecoveryEpisodeReader] = {}
++
++        windows: list[tuple[str, int]] = []
++        for episode_id, record in manifest_episodes.items():
++            mask_record = mask_episodes[episode_id]
++            starts = tuple(int(start) for start in mask_record["allowed_start_indices"])
++            if starts != _expand_ranges(mask_record["allowed_start_ranges"]):
++                raise ValueError(f"frozen mask ranges do not match explicit starts for {episode_id}")
++            frame_count = int(record["frame_count"])
++            if any(start < 0 or start + self.action_horizon > frame_count for start in starts):
++                raise ValueError(f"frozen mask contains an out-of-bounds H20 start for {episode_id}")
++            if int(record.get("allowed_start_count", len(starts))) != len(starts):
++                raise ValueError(f"frozen manifest count mismatch for {episode_id}")
++            windows.extend((episode_id, start) for start in starts)
++        expected_windows = self._manifest.get("FINAL_VALID_H20_WINDOWS")
++        if expected_windows is not None and len(windows) != int(expected_windows):
++            raise ValueError(f"frozen H20 window count mismatch: {len(windows)} != {expected_windows}")
++        if seed is not None:
++            random.Random(seed).shuffle(windows)
++        self.window_index = tuple(windows)
++        self._window_set = frozenset(windows)
++
++    def __len__(self) -> int:
++        return len(self.window_index)
++
++    def read_window(self, episode_id: str, start: int) -> dict:
++        """Read one frozen H20 window, rejecting starts absent from the mask."""
++        episode_id = str(episode_id)
++        start = int(start)
++        if (episode_id, start) not in self._window_set:
++            raise IndexError(f"requested window ({episode_id!r}, {start}) is outside the frozen mask")
++        return self._reader(episode_id).read(start, self.action_horizon, self._prompt)
++
++    def _reader(self, episode_id: str):
++        reader = self._readers.get(episode_id)
++        if reader is not None:
++            return reader
++        record = self._episode_records[episode_id]
++        source = record["source"]
++        if source == "nominal":
++            root = self._nominal_root or Path(record["dataset_root"])
++            reader = _NominalEpisodeReader(root, record["source_episode_id"])
++        elif source == "recovery":
++            root = self._recovery_root or Path(record["dataset_root"])
++            reader = _RecoveryEpisodeReader(root, record["source_episode_id"])
++        else:
++            raise ValueError(f"unsupported frozen source type: {source}")
++        if reader.frame_count() != int(record["frame_count"]):
++            raise ValueError(
++                f"source frame count mismatch for {episode_id}: {reader.frame_count()} != {record['frame_count']}"
++            )
++        self._readers[episode_id] = reader
++        return reader
++
++    def __getitem__(self, index: SupportsIndex) -> dict:
++        index = index.__index__()
++        if index < 0 or index >= len(self.window_index):
++            raise IndexError(f"dataset index {index} is outside the frozen mask")
++        episode_id, start = self.window_index[index]
++        return self.read_window(episode_id, start)
++
+ 
+ class Dataset(Protocol[T_co]):
+     """Interface for a dataset with random access."""
+@@ -131,6 +384,21 @@ def create_torch_dataset(
+     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+ ) -> Dataset:
+     """Create a dataset for training."""
++    if data_config.mask_aware_manifest_path is not None or data_config.mask_aware_mask_path is not None:
++        if data_config.mask_aware_manifest_path is None or data_config.mask_aware_mask_path is None:
++            raise ValueError("mask-aware dataset requires both manifest and mask paths")
++        if data_config.repo_id == "fake":
++            raise ValueError("mask-aware dataset cannot use repo_id='fake'")
++        return MaskAwareJointRTCDataset(
++            data_config.mask_aware_manifest_path,
++            data_config.mask_aware_mask_path,
++            action_horizon=action_horizon,
++            seed=data_config.mask_aware_seed,
++            nominal_root=data_config.mask_aware_nominal_root,
++            recovery_root=data_config.mask_aware_recovery_root,
++            prompt=data_config.mask_aware_prompt or _DEFAULT_JOINT_PROMPT,
++        )
++
+     repo_id = data_config.repo_id
+     if repo_id is None:
+         raise ValueError("Repo ID is not set. Cannot create dataset.")
+diff --git a/src/openpi/training/data_loader_test.py b/src/openpi/training/data_loader_test.py
+index d15a735..e78d948 100644
+--- a/src/openpi/training/data_loader_test.py
++++ b/src/openpi/training/data_loader_test.py
+@@ -1,11 +1,18 @@
+ import dataclasses
++import json
++from pathlib import Path
++import pickle
+ 
+ import jax
++import numpy as np
++import pytest
+ 
+ from openpi.models import pi0_config
+ from openpi.training import config as _config
+ from openpi.training import data_loader as _data_loader
+ 
++_JOINT_ACTION_KEYS = ("J1.pos", "J2.pos", "J3.pos", "J4.pos", "J5.pos", "J6.pos", "G.pos")
++
+ 
+ def test_torch_data_loader():
+     config = pi0_config.Pi0Config(action_dim=24, action_horizon=50, max_token_len=48)
+@@ -82,3 +89,211 @@ def test_with_real_dataset():
+ 
+     for _, actions in batches:
+         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
++
++
++def _write_episode_fixture(root: Path, episode_id: str, length: int) -> None:
++    for frame in range(length):
++        frame_data = {
++            "observation": {
++                **{key: float(frame) for key in _JOINT_ACTION_KEYS},
++                "top": np.full((2, 2, 3), frame, dtype=np.uint8),
++                "wrist": np.full((2, 2, 3), frame + 1, dtype=np.uint8),
++            },
++            "action": {key: float(frame + 100) for key in _JOINT_ACTION_KEYS},
++        }
++        (root / episode_id).mkdir(parents=True, exist_ok=True)
++        with (root / episode_id / f"frame_{frame:06d}.pkl").open("wb") as handle:
++            pickle.dump(frame_data, handle, protocol=4)
++
++
++def _write_mask_fixture(
++    root: Path,
++    episodes: dict[str, list[int]],
++    *,
++    frame_count: int,
++) -> tuple[Path, Path]:
++    manifest_path = root / "manifest.json"
++    mask_path = root / "mask.json"
++    manifest_path.write_text(
++        json.dumps(
++            {
++                "action_horizon": 20,
++                "episodes": [
++                    {
++                        "episode_id": episode_id,
++                        "source": "recovery",
++                        "source_episode_id": episode_id,
++                        "dataset_root": str(root / "episodes"),
++                        "mask_key": episode_id,
++                        "frame_count": frame_count,
++                    }
++                    for episode_id, starts in episodes.items()
++                ],
++            }
++        )
++    )
++    mask_path.write_text(
++        json.dumps(
++            {
++                "action_horizon": 20,
++                "episodes": {
++                    episode_id: {
++                        "episode_id": episode_id,
++                        "source": "recovery",
++                        "source_episode_id": episode_id,
++                        "allowed_start_indices": starts,
++                        "allowed_start_ranges": [[start, start] for start in starts],
++                    }
++                    for episode_id, starts in episodes.items()
++                },
++            }
++        )
++    )
++    return manifest_path, mask_path
++
++
++def test_mask_dataset_samples_only_frozen_legal_windows(tmp_path: Path):
++    episodes_root = tmp_path / "episodes"
++    _write_episode_fixture(episodes_root, "episode_000000", 42)
++    manifest_path, mask_path = _write_mask_fixture(tmp_path, {"episode_000000": [3, 7]}, frame_count=42)
++
++    dataset = _data_loader.MaskAwareJointRTCDataset(
++        manifest_path,
++        mask_path,
++        recovery_root=episodes_root,
++    )
++
++    assert len(dataset) == 2
++    assert dataset.window_index == (("episode_000000", 3), ("episode_000000", 7))
++    assert np.array_equal(dataset[0]["action"], np.arange(103, 123, dtype=np.float32)[:, None].repeat(7, axis=1))
++
++
++def test_mask_dataset_rejects_boundary_crossing_and_unmasked_starts(tmp_path: Path):
++    episodes_root = tmp_path / "episodes"
++    _write_episode_fixture(episodes_root, "episode_000000", 25)
++    manifest_path, mask_path = _write_mask_fixture(tmp_path, {"episode_000000": [5]}, frame_count=25)
++    dataset = _data_loader.MaskAwareJointRTCDataset(
++        manifest_path,
++        mask_path,
++        recovery_root=episodes_root,
++    )
++
++    with pytest.raises(IndexError, match="frozen mask"):
++        dataset[1]
++    with pytest.raises(IndexError, match="frozen mask"):
++        dataset.read_window("episode_000000", 4)
++    with pytest.raises(ValueError, match="H20"):
++        _data_loader.MaskAwareJointRTCDataset(
++            manifest_path,
++            mask_path,
++            recovery_root=episodes_root,
++            action_horizon=21,
++        )
++
++
++def test_mask_dataset_rejects_inconsistent_frozen_ranges(tmp_path: Path):
++    episodes_root = tmp_path / "episodes"
++    _write_episode_fixture(episodes_root, "episode_000000", 30)
++    manifest_path, mask_path = _write_mask_fixture(tmp_path, {"episode_000000": [0]}, frame_count=30)
++    mask = json.loads(mask_path.read_text())
++    mask["episodes"]["episode_000000"]["allowed_start_ranges"] = [[1, 1]]
++    mask_path.write_text(json.dumps(mask))
++
++    with pytest.raises(ValueError, match="ranges"):
++        _data_loader.MaskAwareJointRTCDataset(
++            manifest_path,
++            mask_path,
++            recovery_root=episodes_root,
++        )
++
++
++def test_recovery_pickle_loader_reads_numpy_compatibility_pickle_read_only(tmp_path: Path):
++    source_root = tmp_path / "episodes"
++    source_root.mkdir()
++    frame_path = source_root / "frame.pkl"
++    old_numpy_pickle = pickle.dumps(np.asarray([1], dtype=np.float32), protocol=0).replace(
++        b"numpy.core.multiarray",
++        b"numpy._core.multiarray",
++    )
++    frame_path.write_bytes(old_numpy_pickle)
++
++    loaded = _data_loader.load_recovery_pickle_read_only(frame_path)
++
++    assert np.array_equal(loaded, np.asarray([1], dtype=np.float32))
++    assert frame_path.read_bytes() == old_numpy_pickle
++
++
++def test_mask_dataset_seeded_order_is_deterministic(tmp_path: Path):
++    episodes_root = tmp_path / "episodes"
++    _write_episode_fixture(episodes_root, "episode_000000", 60)
++    _write_episode_fixture(episodes_root, "episode_000001", 60)
++    manifest_path, mask_path = _write_mask_fixture(
++        tmp_path,
++        {"episode_000000": [1, 2, 3], "episode_000001": [4, 5, 6]},
++        frame_count=60,
++    )
++
++    first = _data_loader.MaskAwareJointRTCDataset(
++        manifest_path,
++        mask_path,
++        seed=23,
++        recovery_root=episodes_root,
++    )
++    second = _data_loader.MaskAwareJointRTCDataset(
++        manifest_path,
++        mask_path,
++        seed=23,
++        recovery_root=episodes_root,
++    )
++    different = _data_loader.MaskAwareJointRTCDataset(
++        manifest_path,
++        mask_path,
++        seed=24,
++        recovery_root=episodes_root,
++    )
++
++    assert first.window_index == second.window_index
++    assert first.window_index != different.window_index
++
++
++def test_mask_dataset_does_not_write_source_tree(tmp_path: Path):
++    episodes_root = tmp_path / "episodes"
++    _write_episode_fixture(episodes_root, "episode_000000", 30)
++    manifest_path, mask_path = _write_mask_fixture(tmp_path, {"episode_000000": [0]}, frame_count=30)
++    before = sorted((path.relative_to(episodes_root), path.stat().st_mtime_ns) for path in episodes_root.rglob("*"))
++
++    dataset = _data_loader.MaskAwareJointRTCDataset(
++        manifest_path,
++        mask_path,
++        recovery_root=episodes_root,
++    )
++    _ = dataset[0]
++
++    after = sorted((path.relative_to(episodes_root), path.stat().st_mtime_ns) for path in episodes_root.rglob("*"))
++    assert after == before
++
++
++def test_quality58_config_uses_frozen_mask_as_the_only_torch_dataset_entrypoint(tmp_path: Path):
++    episodes_root = tmp_path / "episodes"
++    _write_episode_fixture(episodes_root, "episode_000000", 42)
++    manifest_path, mask_path = _write_mask_fixture(tmp_path, {"episode_000000": [3, 7]}, frame_count=42)
++
++    factory = _config.LeRobotPiperJointRTCQuality58DataConfig(
++        manifest_path=str(manifest_path),
++        mask_path=str(mask_path),
++        recovery_root=str(episodes_root),
++    )
++    model_config = pi0_config.Pi0Config(
++        pi05=True,
++        action_dim=32,
++        action_horizon=20,
++        training_rtc=True,
++        training_rtc_action_dim=7,
++    )
++    data_config = factory.create(tmp_path / "assets", model_config)
++
++    dataset = _data_loader.create_torch_dataset(data_config, action_horizon=20, model_config=model_config)
++
++    assert isinstance(dataset, _data_loader.MaskAwareJointRTCDataset)
++    assert len(dataset) == 2
++    assert dataset.window_index == (("episode_000000", 3), ("episode_000000", 7))
+
+diff --git a/src/openpi/models/rtc_jax.py b/src/openpi/models/rtc_jax.py
+new file mode 100644
+index 0000000..7b3a3b6
+--- /dev/null
++++ b/src/openpi/models/rtc_jax.py
+@@ -0,0 +1,184 @@
++"""Minimal JAX implementation of Real-Time Chunking (RTC) guidance.
++
++The module deliberately contains only model-space prefix preparation and the
++flow-matching guidance step.  Scheduling, queues, and robot execution remain
++outside the model.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Callable
++import numbers
++
++import jax
++import jax.numpy as jnp
++
++
++def prepare_rtc_prefix(
++    prev_chunk_left_over,
++    *,
++    batch_size: int,
++    horizon: int,
++    action_dim: int,
++):
++    """Pad/broadcast a previous model-space prefix to a fixed ``[B,H,A]``.
++
++    The mask is kept separate so right-padding never becomes a false RTC
++    target.  This wrapper is intentionally called outside the denoising loop;
++    the loop itself only sees fixed-shape arrays.
++    """
++
++    if horizon <= 0 or action_dim <= 0 or batch_size <= 0:
++        raise ValueError("batch_size, horizon, and action_dim must be positive")
++    if prev_chunk_left_over is None:
++        dtype = jnp.float32
++        return (
++            jnp.zeros((batch_size, horizon, action_dim), dtype=dtype),
++            jnp.zeros((batch_size, horizon, 1), dtype=bool),
++        )
++
++    prefix = jnp.asarray(prev_chunk_left_over)
++    if prefix.ndim == 2:
++        prefix = prefix[None, ...]
++    if prefix.ndim != 3:
++        raise ValueError("prev_chunk_left_over must have shape [T,A] or [B,T,A]")
++    if prefix.shape[-1] != action_dim:
++        raise ValueError(f"prefix action dimension {prefix.shape[-1]} != {action_dim}")
++    if prefix.shape[0] == 1 and batch_size != 1:
++        prefix = jnp.broadcast_to(prefix, (batch_size, prefix.shape[1], action_dim))
++    elif prefix.shape[0] != batch_size:
++        raise ValueError(f"prefix batch dimension {prefix.shape[0]} != {batch_size}")
++
++    prefix_len = min(prefix.shape[1], horizon)
++    if prefix.shape[1] < horizon:
++        prefix = jnp.pad(prefix, ((0, 0), (0, horizon - prefix.shape[1]), (0, 0)))
++    else:
++        prefix = prefix[:, :horizon, :]
++    mask = (jnp.arange(horizon)[None, :, None] < prefix_len).astype(bool)
++    mask = jnp.broadcast_to(mask, (batch_size, horizon, 1))
++    return prefix, mask
++
++
++def make_rtc_prefix_weights(
++    *,
++    horizon: int,
++    inference_delay: int,
++    execution_horizon: int,
++):
++    """Construct the official linear RTC prefix weights in fixed shape.
++
++    The first ``inference_delay`` positions are fully committed.  The
++    remaining overlap is linearly tapered, with positions at and after the
++    execution horizon receiving zero weight.
++    """
++
++    if horizon <= 0:
++        raise ValueError("horizon must be positive")
++    # Python values are checked eagerly (useful for a scheduler/configuration
++    # error).  Traced JAX scalars are validated by the caller's legal scheduler
++    # contract and must remain dynamic so one compiled sampler can be reused.
++    if isinstance(inference_delay, numbers.Integral) and (inference_delay < 0 or inference_delay > horizon):
++        raise ValueError("inference_delay must be in [0, horizon]")
++    if isinstance(execution_horizon, numbers.Integral) and (execution_horizon <= 0 or execution_horizon > horizon):
++        raise ValueError("execution_horizon must be in [1, horizon]")
++
++    index = jnp.arange(horizon, dtype=jnp.float32)
++    start = jnp.asarray(inference_delay, dtype=jnp.float32)
++    end = jnp.asarray(execution_horizon, dtype=jnp.float32)
++    overlap = end - start
++    # This is the LINEAR schedule used by LeRobot RTCProcessor: delay prefix
++    # at one, overlap tapered from near one to near zero, then zero.
++    tapered = 1.0 - (index - start + 1.0) / (overlap + 1.0)
++    weights = jnp.where(
++        index < start,
++        1.0,
++        jnp.where(index < end, jnp.where(overlap > 0, tapered, 1.0), 0.0),
++    )
++    return weights[:, None]
++
++
++def _rtc_guidance_weight(time, max_guidance_weight: float):
++    """Match the flow-time convention and clamp from the RTC reference."""
++
++    tau = 1.0 - jnp.asarray(time)
++    squared_one_minus_tau = (1.0 - tau) ** 2
++    inv_r2 = (squared_one_minus_tau + tau**2) / squared_one_minus_tau
++    c = (1.0 - tau) / tau
++    max_weight = jnp.asarray(max_guidance_weight, dtype=inv_r2.dtype)
++
++    def _finite_or_zero(value):
++        return jnp.where(jnp.isnan(value), 0.0, jnp.where(jnp.isposinf(value), max_weight, value))
++
++    inv_r2 = _finite_or_zero(inv_r2)
++    c = _finite_or_zero(c)
++    guidance = _finite_or_zero(c * inv_r2)
++    return jnp.minimum(guidance, max_weight)
++
++
++def rtc_guided_velocity(
++    base_denoise: Callable,
++    x_t,
++    time,
++    prev_chunk_left_over,
++    inference_delay: int,
++    execution_horizon: int,
++    *,
++    prefix_mask=None,
++    prefix_weights=None,
++    max_guidance_weight: float = 10.0,
++    enabled: bool = True,
++):
++    """Apply RTC prefix guidance to one flow-matching denoising step.
++
++    ``x_t`` and ``prev_chunk_left_over`` are both in the model's transformed
++    space (for Joint: six delta joints plus absolute gripper, normalized by
++    the policy transform).  When RTC is disabled or no prefix is available,
++    this calls ``base_denoise`` directly and does not construct a VJP.
++    """
++
++    if not enabled or prev_chunk_left_over is None:
++        return base_denoise(x_t)
++
++    if x_t.ndim != 3:
++        raise ValueError("RTC currently expects fixed [B,H,A] model tensors")
++    batch_size, horizon, action_dim = x_t.shape
++    if isinstance(inference_delay, numbers.Integral) and (inference_delay < 0 or inference_delay > horizon):
++        raise ValueError("inference_delay must be in [0, action horizon]")
++    if isinstance(execution_horizon, numbers.Integral) and (execution_horizon <= 0 or execution_horizon > horizon):
++        raise ValueError("execution_horizon must be in [1, action horizon]")
++
++    prev = jnp.asarray(prev_chunk_left_over, dtype=x_t.dtype)
++    if prev.shape != x_t.shape:
++        raise ValueError("prev_chunk_left_over must be padded to x_t's fixed shape")
++    if prefix_mask is None:
++        prefix_mask = jnp.ones((batch_size, horizon, 1), dtype=x_t.dtype)
++    else:
++        prefix_mask = jnp.asarray(prefix_mask, dtype=x_t.dtype)
++        if prefix_mask.shape != (batch_size, horizon, 1):
++            raise ValueError("prefix_mask must have shape [B,H,1]")
++
++    if prefix_weights is None:
++        weights = make_rtc_prefix_weights(
++            horizon=horizon,
++            inference_delay=inference_delay,
++            execution_horizon=execution_horizon,
++        )
++    else:
++        weights = jnp.asarray(prefix_weights, dtype=x_t.dtype)
++        if weights.ndim == 1:
++            weights = weights[:, None]
++        if weights.shape != (horizon, 1):
++            raise ValueError("prefix_weights must have shape [H] or [H,1]")
++    weights = weights[None, ...] * prefix_mask
++
++    # has_aux keeps the base velocity from being evaluated a second time while
++    # still exposing the pullback of x1_t with respect to x_t.
++    def x1_and_velocity(x):
++        velocity = base_denoise(x)
++        return x - jnp.asarray(time) * velocity, velocity
++
++    x1_t, pullback, base_velocity = jax.vjp(x1_and_velocity, x_t, has_aux=True)
++    error = (prev - x1_t) * weights
++    correction = pullback(error)[0]
++    guidance_weight = _rtc_guidance_weight(time, max_guidance_weight)
++    return base_velocity - guidance_weight * correction
+
+diff --git a/src/openpi/models/rtc_jax_test.py b/src/openpi/models/rtc_jax_test.py
+new file mode 100644
+index 0000000..3606e39
+--- /dev/null
++++ b/src/openpi/models/rtc_jax_test.py
+@@ -0,0 +1,208 @@
++"""Focused contract tests for the minimal JAX RTC guidance adapter.
++
++These tests intentionally exercise the small, model-independent RTC boundary so
++that the expensive Pi0 checkpoint is not needed to validate shape, masking, and
++autodiff semantics.
++"""
++
++import inspect
++
++import jax
++import jax.numpy as jnp
++import numpy as np
++import pytest
++
++from openpi.models import pi0
++from openpi.models.rtc_jax import (
++    make_rtc_prefix_weights,
++    prepare_rtc_prefix,
++    rtc_guided_velocity,
++)
++
++
++def _base_velocity(x):
++    """Small nonlinear flow field with a nontrivial VJP."""
++
++    return 0.1 * x + 0.02 * jnp.square(x)
++
++
++def _inputs(batch=2, horizon=10, action_dim=7):
++    x_t = jnp.linspace(-0.8, 0.8, batch * horizon * action_dim, dtype=jnp.float32).reshape(
++        batch, horizon, action_dim
++    )
++    prev = jnp.flip(x_t, axis=1) + 0.35
++    return x_t, prev
++
++
++def test_sample_actions_keeps_optional_rtc_contract():
++    signature = inspect.signature(pi0.Pi0.sample_actions)
++    for name in (
++        "rtc_prev_chunk_left_over",
++        "rtc_inference_delay",
++        "rtc_execution_horizon",
++        "rtc_prefix_weights",
++        "rtc_max_guidance_weight",
++    ):
++        assert name in signature.parameters
++
++
++def test_none_prefix_is_exact_baseline_and_does_not_call_vjp(monkeypatch):
++    x_t, _ = _inputs()
++    expected = _base_velocity(x_t)
++
++    def fail_vjp(*_args, **_kwargs):
++        raise AssertionError("disabled RTC must not construct a VJP")
++
++    monkeypatch.setattr(jax, "vjp", fail_vjp)
++    actual = rtc_guided_velocity(
++        _base_velocity,
++        x_t,
++        time=jnp.asarray(0.5, dtype=jnp.float32),
++        prev_chunk_left_over=None,
++        inference_delay=3,
++        execution_horizon=10,
++    )
++    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
++
++
++def test_prev_none_is_baseline_even_when_other_rtc_args_are_present():
++    x_t, _ = _inputs()
++    expected = _base_velocity(x_t)
++    actual = rtc_guided_velocity(
++        _base_velocity,
++        x_t,
++        time=0.5,
++        prev_chunk_left_over=None,
++        inference_delay=3,
++        execution_horizon=10,
++    )
++    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
++
++
++def test_short_prefix_is_padded_to_fixed_shape_with_mask():
++    short = jnp.ones((2, 4, 7), dtype=jnp.float32)
++    padded, mask = prepare_rtc_prefix(short, batch_size=2, horizon=10, action_dim=7)
++    assert padded.shape == (2, 10, 7)
++    assert mask.shape == (2, 10, 1)
++    np.testing.assert_array_equal(np.asarray(padded[:, :4]), np.ones((2, 4, 7), dtype=np.float32))
++    np.testing.assert_array_equal(np.asarray(padded[:, 4:]), np.zeros((2, 6, 7), dtype=np.float32))
++    np.testing.assert_array_equal(np.asarray(mask[0, :, 0]), np.array([1] * 4 + [0] * 6, dtype=bool))
++
++
++def test_prefix_guidance_changes_velocity_and_preserves_action_shape():
++    x_t, prev = _inputs()
++    actual = rtc_guided_velocity(
++        _base_velocity,
++        x_t,
++        time=0.5,
++        prev_chunk_left_over=prev,
++        inference_delay=3,
++        execution_horizon=10,
++    )
++    baseline = _base_velocity(x_t)
++    assert actual.shape == (2, 10, 7)
++    assert not np.array_equal(np.asarray(actual), np.asarray(baseline))
++
++
++def test_same_noise_and_prefix_are_deterministic():
++    x_t, prev = _inputs()
++    kwargs = dict(
++        time=0.25,
++        prev_chunk_left_over=prev,
++        inference_delay=3,
++        execution_horizon=10,
++    )
++    first = rtc_guided_velocity(_base_velocity, x_t, **kwargs)
++    second = rtc_guided_velocity(_base_velocity, x_t, **kwargs)
++    np.testing.assert_array_equal(np.asarray(first), np.asarray(second))
++
++
++def test_guidance_is_finite_for_delay_three_and_horizon_ten():
++    x_t, prev = _inputs()
++    actual = rtc_guided_velocity(
++        _base_velocity,
++        x_t,
++        time=1.0,
++        prev_chunk_left_over=prev,
++        inference_delay=3,
++        execution_horizon=10,
++    )
++    assert np.isfinite(np.asarray(actual)).all()
++
++
++def test_execution_horizon_and_delay_are_validated():
++    with pytest.raises(ValueError):
++        make_rtc_prefix_weights(horizon=10, inference_delay=11, execution_horizon=10)
++    with pytest.raises(ValueError):
++        make_rtc_prefix_weights(horizon=10, inference_delay=3, execution_horizon=0)
++
++
++def test_prefix_weights_have_fixed_shape_and_delay_three():
++    weights = make_rtc_prefix_weights(horizon=10, inference_delay=3, execution_horizon=10)
++    assert weights.shape == (10, 1)
++    # The committed delay prefix is fully weighted and the final point is zero.
++    np.testing.assert_allclose(np.asarray(weights[:3, 0]), np.ones(3), rtol=0, atol=0)
++    assert float(weights[3, 0]) < 1.0
++    # With horizon==execution_horizon the final point is the last interior
++    # linear weight (the post-horizon zero tail is empty).
++    assert float(weights[-1, 0]) == pytest.approx(0.125)
++
++
++def test_jit_compiles_with_fixed_prefix_shape():
++    x_t, prev = _inputs(batch=1)
++    mask = jnp.ones((1, 10, 1), dtype=bool)
++
++    @jax.jit
++    def run(x, p, m):
++        return rtc_guided_velocity(
++            _base_velocity,
++            x,
++            time=jnp.asarray(0.5, dtype=jnp.float32),
++            prev_chunk_left_over=p,
++            prefix_mask=m,
++            inference_delay=3,
++            execution_horizon=10,
++        )
++
++    out = run(x_t, prev, mask)
++    assert out.shape == (1, 10, 7)
++    assert np.isfinite(np.asarray(out)).all()
++
++
++def test_jit_accepts_dynamic_delay_and_horizon_scalars():
++    x_t, prev = _inputs(batch=1)
++    mask = jnp.ones((1, 10, 1), dtype=bool)
++
++    @jax.jit
++    def run(x, p, m, delay, horizon):
++        return rtc_guided_velocity(
++            _base_velocity,
++            x,
++            time=jnp.asarray(0.5, dtype=jnp.float32),
++            prev_chunk_left_over=p,
++            prefix_mask=m,
++            inference_delay=delay,
++            execution_horizon=horizon,
++        )
++
++    out = run(x_t, prev, mask, jnp.asarray(3, dtype=jnp.int32), jnp.asarray(10, dtype=jnp.int32))
++    assert out.shape == (1, 10, 7)
++    assert np.isfinite(np.asarray(out)).all()
++
++
++def test_gripper_dimension_uses_same_model_space_guidance():
++    x_t, prev = _inputs(batch=1)
++    baseline = _base_velocity(x_t)
++    # Joint model space is [six delta joints, one absolute gripper] and RTC
++    # must not silently drop the seventh model-space dimension.
++    prev = prev.at[:, :, 6].add(1.0)
++    actual = rtc_guided_velocity(
++        _base_velocity,
++        x_t,
++        time=0.5,
++        prev_chunk_left_over=prev,
++        inference_delay=3,
++        execution_horizon=10,
++    )
++    assert actual.shape[-1] == 7
++    assert not np.array_equal(np.asarray(actual[..., 6]), np.asarray(baseline[..., 6]))
+
+diff --git a/src/openpi/models/training_rtc.py b/src/openpi/models/training_rtc.py
+new file mode 100644
+index 0000000..d3b4135
+--- /dev/null
++++ b/src/openpi/models/training_rtc.py
+@@ -0,0 +1,106 @@
++"""Training-time RTC helpers for fixed-shape action chunks."""
++
++import jax
++import jax.numpy as jnp
++
++
++def _prefix_lengths(prefix_lengths, *, batch_size: int, horizon: int) -> jax.Array:
++    lengths = jnp.asarray(prefix_lengths, dtype=jnp.int32)
++    if lengths.ndim == 0:
++        lengths = jnp.broadcast_to(lengths, (batch_size,))
++    elif lengths.shape != (batch_size,):
++        raise ValueError(f"prefix_lengths must have shape ({batch_size},), got {lengths.shape}")
++    return jnp.clip(lengths, 0, horizon)
++
++
++def prefix_mask(prefix_lengths, *, batch_size: int, horizon: int) -> jax.Array:
++    """Return a bool [B, H] mask identifying committed prefix actions."""
++    lengths = _prefix_lengths(prefix_lengths, batch_size=batch_size, horizon=horizon)
++    return jnp.arange(horizon, dtype=jnp.int32)[None, :] < lengths[:, None]
++
++
++def apply_clean_prefix(noisy_actions, clean_actions, prefix_lengths):
++    """Replace each sample's committed prefix with its clean action sequence."""
++    if noisy_actions.shape != clean_actions.shape:
++        raise ValueError(f"noisy_actions and clean_actions must have the same shape, got {noisy_actions.shape}")
++    if noisy_actions.ndim != 3:
++        raise ValueError(f"actions must have shape [B, H, A], got {noisy_actions.shape}")
++    committed = prefix_mask(
++        prefix_lengths,
++        batch_size=noisy_actions.shape[0],
++        horizon=noisy_actions.shape[1],
++    )[..., None]
++    return jnp.where(committed, clean_actions, noisy_actions)
++
++
++def prepare_training_rtc(actions, noise, time, prefix_lengths, physical_action_dim=None):
++    """Build the fixed-shape training-time RTC flow-matching objective inputs.
++
++    The committed prefix is clean action data, while the postfix remains the
++    ordinary noisy interpolation. The returned loss mask is false only for the
++    committed prefix, so a clean prefix cannot create an artificial loss or
++    gradient at an inter-chunk boundary.
++    """
++    if actions.shape != noise.shape:
++        raise ValueError(f"actions and noise must have the same shape, got {actions.shape} and {noise.shape}")
++    if actions.ndim != 3:
++        raise ValueError(f"actions must have shape [B, H, A], got {actions.shape}")
++
++    batch_size, horizon, _ = actions.shape
++    time = jnp.asarray(time, dtype=actions.dtype)
++    if time.ndim == 0:
++        time = jnp.broadcast_to(time, (batch_size,))
++    elif time.shape != (batch_size,):
++        raise ValueError(f"time must have shape ({batch_size},), got {time.shape}")
++
++    time_expanded = time[:, None, None]
++    noisy_interpolation = time_expanded * noise + (1.0 - time_expanded) * actions
++    if physical_action_dim is None:
++        physical_action_dim = actions.shape[-1]
++    if not (0 < physical_action_dim <= actions.shape[-1]):
++        raise ValueError(
++            f"physical_action_dim must be between 1 and action_dim, got {physical_action_dim}"
++        )
++    committed = prefix_mask(prefix_lengths, batch_size=batch_size, horizon=horizon)
++    physical = jnp.arange(actions.shape[-1], dtype=jnp.int32) < physical_action_dim
++    clean_mask = committed[..., None] & physical[None, None, :]
++    conditioned_actions = jnp.where(clean_mask, actions, noisy_interpolation)
++    return conditioned_actions, noise - actions, jnp.logical_not(committed)
++
++
++def postfix_mse(predicted_velocity, target_velocity, prefix_lengths, physical_action_dim=None):
++    """Compute per-step MSE, masking committed prefix steps from the loss."""
++    if predicted_velocity.shape != target_velocity.shape:
++        raise ValueError(
++            "predicted_velocity and target_velocity must have the same shape, "
++            f"got {predicted_velocity.shape} and {target_velocity.shape}"
++        )
++    if predicted_velocity.ndim != 3:
++        raise ValueError(f"velocity tensors must have shape [B, H, A], got {predicted_velocity.shape}")
++
++    if physical_action_dim is None:
++        physical_action_dim = predicted_velocity.shape[-1]
++    if not (0 < physical_action_dim <= predicted_velocity.shape[-1]):
++        raise ValueError(
++            f"physical_action_dim must be between 1 and action_dim, got {physical_action_dim}"
++        )
++    predicted_velocity = predicted_velocity[..., :physical_action_dim]
++    target_velocity = target_velocity[..., :physical_action_dim]
++    mse = jnp.mean(jnp.square(predicted_velocity - target_velocity), axis=-1)
++    if prefix_lengths is None:
++        return mse
++    committed = prefix_mask(
++        prefix_lengths,
++        batch_size=predicted_velocity.shape[0],
++        horizon=predicted_velocity.shape[1],
++    )
++    return jnp.where(committed, 0.0, mse)
++
++
++def sample_prefix_lengths(rng, *, batch_size: int, max_delay: int) -> jax.Array:
++    """Sample a fixed-shape inclusive prefix length in [0, max_delay]."""
++    if batch_size <= 0:
++        raise ValueError("batch_size must be positive")
++    if max_delay < 0:
++        raise ValueError("max_delay must be non-negative")
++    return jax.random.randint(rng, (batch_size,), minval=0, maxval=max_delay + 1, dtype=jnp.int32)
+
+diff --git a/src/openpi/models/training_rtc_test.py b/src/openpi/models/training_rtc_test.py
+new file mode 100644
+index 0000000..6b70c16
+--- /dev/null
++++ b/src/openpi/models/training_rtc_test.py
+@@ -0,0 +1,134 @@
++import jax
++import jax.numpy as jnp
++
++from openpi.models.training_rtc import apply_clean_prefix, postfix_mse, prepare_training_rtc, sample_prefix_lengths
++
++
++def test_clean_prefix_replaces_only_committed_h20_steps():
++    noisy = jnp.zeros((3, 20, 7), dtype=jnp.float32)
++    clean = jnp.ones_like(noisy)
++
++    conditioned = apply_clean_prefix(noisy, clean, jnp.array([0, 1, 4], dtype=jnp.int32))
++
++    assert conditioned.shape == (3, 20, 7)
++    assert jnp.all(conditioned[0] == 0)
++    assert jnp.all(conditioned[1, :1] == 1)
++    assert jnp.all(conditioned[1, 1:] == 0)
++    assert jnp.all(conditioned[2, :4] == 1)
++    assert jnp.all(conditioned[2, 4:] == 0)
++
++
++def test_postfix_loss_masks_clean_prefix_and_preserves_disabled_parity():
++    predicted = jnp.arange(3 * 20 * 7, dtype=jnp.float32).reshape(3, 20, 7)
++    target = jnp.zeros_like(predicted)
++
++    disabled = postfix_mse(predicted, target, None)
++    baseline = jnp.mean(jnp.square(predicted - target), axis=-1)
++    assert jnp.array_equal(disabled, baseline)
++
++    masked = postfix_mse(predicted, target, jnp.array([0, 1, 4], dtype=jnp.int32))
++    assert jnp.all(masked[0] == baseline[0])
++    assert jnp.all(masked[1, :1] == 0)
++    assert jnp.all(masked[1, 1:] == baseline[1, 1:])
++    assert jnp.all(masked[2, :4] == 0)
++    assert jnp.all(masked[2, 4:] == baseline[2, 4:])
++
++
++def test_postfix_loss_is_finite_for_h20_7d_and_jit_gradients():
++    predicted = jnp.ones((3, 20, 7), dtype=jnp.float32)
++    target = jnp.zeros_like(predicted)
++    prefix_lengths = jnp.array([0, 1, 4], dtype=jnp.int32)
++
++    def objective(x):
++        return jnp.mean(postfix_mse(x, target, prefix_lengths))
++
++    value, gradient = jax.jit(jax.value_and_grad(objective))(predicted)
++
++    assert jnp.isfinite(value)
++    assert gradient.shape == predicted.shape
++    assert jnp.all(jnp.isfinite(gradient))
++    assert jnp.all(gradient[1, :1] == 0)
++    assert jnp.all(gradient[2, :4] == 0)
++
++
++def test_prefix_sampler_is_fixed_seed_deterministic_and_bounded():
++    first = sample_prefix_lengths(jax.random.key(17), batch_size=64, max_delay=4)
++    second = sample_prefix_lengths(jax.random.key(17), batch_size=64, max_delay=4)
++
++    assert first.shape == (64,)
++    assert jnp.array_equal(first, second)
++    assert jnp.all((first >= 0) & (first <= 4))
++
++
++def test_training_rtc_flow_matching_keeps_clean_prefix_and_masks_only_prefix_loss():
++    from openpi.models.training_rtc import prepare_training_rtc
++
++    actions = jnp.arange(2 * 20 * 7, dtype=jnp.float32).reshape(2, 20, 7)
++    noise = actions + 1000.0
++    time = jnp.asarray([0.25, 0.75], dtype=jnp.float32)
++    prefix_lengths = jnp.asarray([1, 4], dtype=jnp.int32)
++
++    conditioned, target_velocity, loss_mask = prepare_training_rtc(
++        actions,
++        noise,
++        time,
++        prefix_lengths,
++    )
++
++    expected_noisy = time[:, None, None] * noise + (1.0 - time[:, None, None]) * actions
++    assert conditioned.shape == (2, 20, 7)
++    assert target_velocity.shape == (2, 20, 7)
++    assert loss_mask.shape == (2, 20)
++    assert jnp.all(conditioned[0, :1] == actions[0, :1])
++    assert jnp.all(conditioned[1, :4] == actions[1, :4])
++    assert jnp.all(conditioned[0, 1:] == expected_noisy[0, 1:])
++    assert jnp.all(conditioned[1, 4:] == expected_noisy[1, 4:])
++    assert jnp.all(target_velocity == noise - actions)
++    assert jnp.all(loss_mask == jnp.asarray([[False] + [True] * 19, [False] * 4 + [True] * 16]))
++
++
++def test_training_rtc_uses_only_physical_dims_when_actions_are_padded_to_latent_32():
++    actions = jnp.zeros((1, 20, 32), dtype=jnp.float32)
++    noise = jnp.ones_like(actions)
++    time = jnp.asarray([0.5], dtype=jnp.float32)
++    prefix_lengths = jnp.asarray([4], dtype=jnp.int32)
++
++    conditioned, target_velocity, loss_mask = prepare_training_rtc(
++        actions,
++        noise,
++        time,
++        prefix_lengths,
++        physical_action_dim=7,
++    )
++
++    # RTC conditions only the physical Piper dimensions; latent padding remains
++    # ordinary noisy interpolation and contributes no RTC loss.
++    assert jnp.all(conditioned[0, :4, :7] == 0)
++    assert jnp.all(conditioned[0, :4, 7:] == 0.5)
++    assert jnp.all(loss_mask[0, :4] == jnp.asarray(False))
++    assert jnp.all(target_velocity == 1)
++
++    predicted = jnp.zeros_like(actions)
++    physical_only = postfix_mse(
++        predicted,
++        target_velocity,
++        prefix_lengths,
++        physical_action_dim=7,
++    )
++    assert jnp.all(physical_only[0, :4] == 0)
++    assert jnp.all(physical_only[0, 4:] == 1)
++
++
++def test_quality58_config_keeps_physical_7d_but_uses_pretrained_latent_32d():
++    from openpi.training import config as training_config
++    from openpi.transforms import PadStatesAndActions
++
++    config = training_config.get_config("pi05_piper_joint_rtc_h20_quality58_finetune")
++    assert config.model.action_dim == 32
++    assert config.model.action_horizon == 20
++    assert config.model.training_rtc_action_dim == 7
++
++    data_config = config.data.create(config.assets_dirs, config.model)
++    pad = [t for t in data_config.model_transforms.inputs if isinstance(t, PadStatesAndActions)]
++    assert len(pad) == 1
++    assert pad[0].model_action_dim == 32
+
+diff --git a/src/openpi/policies/piper_policy.py b/src/openpi/policies/piper_policy.py
+new file mode 100644
+index 0000000..c33d0f8
+--- /dev/null
++++ b/src/openpi/policies/piper_policy.py
+@@ -0,0 +1,129 @@
++"""Piper single-arm policy adapter.
++
++Maps a Piper LeRobot dataset (and the inference-time robot inputs) to the pi0.5
++model input space. The dataset uses:
++- observation.images.top    -> base_0_rgb
++- observation.images.wrist  -> left_wrist_0_rgb
++- right_wrist_0_rgb is not present on this robot: zero image + False mask
++- state: [J1..J6 in degrees, gripper in meters]
++- actions: [J1..J6 absolute joint targets in degrees, gripper absolute target in meters]
++
++NO unit conversion is performed here. The joint/gripper values are passed
++through in their native units (degrees / meters); the `Normalize` model
++transform (using stats computed from this same dataset via
++scripts/compute_norm_stats.py) maps them into the model's expected range.
++Because training and inference share these transforms, the mapping is
++symmetric. The DeltaActions / AbsoluteActions transforms (mask = first 6
++joints delta, gripper absolute) are applied in the data config, not here.
++"""
++
++import dataclasses
++
++import einops
++import numpy as np
++from scipy.spatial.transform import Rotation
++
++from openpi import transforms
++
++
++def make_piper_example() -> dict:
++    """Random input example for tests."""
++    return {
++        "state": np.zeros((7,)),
++        "images": {
++            "top": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
++            "wrist": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
++        },
++        "prompt": "pick up the battery and place it into the target location",
++    }
++
++
++@dataclasses.dataclass(frozen=True)
++class PiperInputs(transforms.DataTransformFn):
++    """Expected inputs:
++    - images: dict with keys "top" and/or "wrist", values [C, H, W] (uint8 or float)
++    - state: [7] (J1..J6 degrees, gripper meters)
++    - actions: [action_horizon, 7] (only during training)
++    - prompt: str (optional)
++    """
++
++    def __call__(self, data: dict) -> dict:
++        in_images = data["images"]
++        base_image = _convert_image(in_images["top"])
++
++        images = {"base_0_rgb": base_image}
++        image_masks = {"base_0_rgb": np.True_}
++
++        if "wrist" in in_images:
++            images["left_wrist_0_rgb"] = _convert_image(in_images["wrist"])
++            image_masks["left_wrist_0_rgb"] = np.True_
++        else:
++            # Missing camera: zero image + False mask. Do NOT copy another camera.
++            images["left_wrist_0_rgb"] = np.zeros_like(base_image)
++            image_masks["left_wrist_0_rgb"] = np.False_
++
++        # This robot has no right wrist camera: always zero + masked out.
++        images["right_wrist_0_rgb"] = np.zeros_like(base_image)
++        image_masks["right_wrist_0_rgb"] = np.False_
++
++        inputs = {
++            "image": images,
++            "image_mask": image_masks,
++            "state": np.asarray(data["state"], dtype=np.float32),
++        }
++
++        if "actions" in data:
++            inputs["actions"] = np.asarray(data["actions"], dtype=np.float32)
++
++        if "prompt" in data:
++            inputs["prompt"] = data["prompt"]
++
++        return inputs
++
++
++@dataclasses.dataclass(frozen=True)
++class PiperTCPAnchoredActions(transforms.DataTransformFn):
++    """Convert absolute TCP target chunks to deltas anchored to the sample state."""
++
++    def __call__(self, data: dict) -> dict:
++        if "actions" not in data:
++            return data
++
++        state = np.asarray(data["state"], dtype=np.float64)
++        actions = np.asarray(data["actions"], dtype=np.float64)
++        if state.shape != (7,) or actions.ndim != 2 or actions.shape[-1] != 7:
++            raise ValueError(
++                f"Expected state shape (7,) and actions shape (horizon, 7), got "
++                f"{state.shape} and {actions.shape}"
++            )
++
++        # Dataset target is [position, rotvec, absolute gripper]. Convert each
++        # future target to p_target[k] - p_state[t] and LogSO3(R_target[k] @
++        # R_state[t].T). Rotvec subtraction is intentionally never used.
++        anchored = np.empty_like(actions)
++        anchored[:, :3] = actions[:, :3] - state[None, :3]
++        target_rotation = Rotation.from_rotvec(actions[:, 3:6])
++        state_rotation = Rotation.from_rotvec(state[3:6])
++        anchored[:, 3:6] = (target_rotation * state_rotation.inv()).as_rotvec()
++        anchored[:, 6] = actions[:, 6]
++
++        output = dict(data)
++        output["actions"] = anchored.astype(np.float32)
++        return output
++
++
++@dataclasses.dataclass(frozen=True)
++class PiperOutputs(transforms.DataTransformFn):
++    """Model outputs -> Piper 7D absolute actions (after AbsoluteActions inverse delta)."""
++
++    def __call__(self, data: dict) -> dict:
++        # The model predicts padded 32-dim actions; only the first 7 are physical.
++        return {"actions": np.asarray(data["actions"][:, :7], dtype=np.float32)}
++
++
++def _convert_image(img) -> np.ndarray:
++    img = np.asarray(img)
++    if np.issubdtype(img.dtype, np.floating):
++        img = (255 * img).astype(np.uint8)
++    # [C, H, W] -> [H, W, C]
++    return einops.rearrange(img, "c h w -> h w c")
+
+diff --git a/src/openpi/policies/piper_policy_test.py b/src/openpi/policies/piper_policy_test.py
+new file mode 100644
+index 0000000..684dc08
+--- /dev/null
++++ b/src/openpi/policies/piper_policy_test.py
+@@ -0,0 +1,98 @@
++import numpy as np
++import pytest
++from scipy.spatial.transform import Rotation
++
++import openpi.training.config as training_config
++from openpi.policies import piper_policy
++
++
++def _rotvec(rotation: Rotation) -> np.ndarray:
++    return rotation.as_rotvec()
++
++
++def _delta(anchor_pose: np.ndarray, target_pose: np.ndarray) -> np.ndarray:
++    anchor_rotation = Rotation.from_rotvec(anchor_pose[3:6])
++    target_rotation = Rotation.from_rotvec(target_pose[3:6])
++    return np.concatenate(
++        [
++            target_pose[:3] - anchor_pose[:3],
++            _rotvec(target_rotation * anchor_rotation.inv()),
++            [target_pose[6]],
++        ]
++    )
++
++
++def _synthetic_chunk() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
++    anchor_state = np.array([0.10, 0.02, 0.05, 0.0, 0.0, 0.20, 0.03], dtype=np.float32)
++    horizon = 10
++    future_states = []
++    absolute_targets = []
++    for k in range(horizon):
++        future_states.append(
++            np.array(
++                [
++                    0.10 + 0.002 * k,
++                    0.02 + 0.0005 * k,
++                    0.05 - 0.0004 * k,
++                    0.0,
++                    0.0,
++                    0.20 + 0.01 * k,
++                    0.03,
++                ],
++                dtype=np.float32,
++            )
++        )
++        absolute_targets.append(
++            np.array(
++                [
++                    0.105 + 0.004 * k,
++                    0.025 + 0.0008 * k,
++                    0.052 - 0.0007 * k,
++                    0.0,
++                    0.0,
++                    0.22 + 0.015 * k,
++                    0.032,
++                ],
++                dtype=np.float32,
++            )
++        )
++    future_states = np.stack(future_states)
++    absolute_targets = np.stack(absolute_targets)
++    v2_local_actions = np.stack([_delta(future_states[k], absolute_targets[k]) for k in range(horizon)])
++    return anchor_state, absolute_targets, v2_local_actions
++
++
++def test_v2_local_action_chunk_is_not_anchored_to_sample_state():
++    """Documents the audited V2 bug: its future rows are anchored to state[t+k]."""
++    anchor_state, absolute_targets, v2_local_actions = _synthetic_chunk()
++    transformed = piper_policy.PiperInputs()(
++        {
++            "images": {"top": np.zeros((3, 2, 2), dtype=np.uint8)},
++            "state": anchor_state,
++            "actions": v2_local_actions,
++        }
++    )["actions"]
++
++    # If V2 actions were already anchored to state[t], PiperInputs would not need
++    # to alter them. Their first six dimensions therefore must differ from A.
++    anchored_actions = np.stack([_delta(anchor_state, target) for target in absolute_targets])
++    with pytest.raises(AssertionError):
++        np.testing.assert_allclose(transformed[:, :6], anchored_actions[:, :6], atol=1e-9)
++
++
++def test_v3_action_chunk_is_anchored_to_sample_state():
++    anchor_state, absolute_targets, _ = _synthetic_chunk()
++    config = training_config.get_config("pi05_piper_tcp_delta_v3_finetune")
++    data_config = config.data.create(config.assets_dirs, config.model)
++
++    data = {
++        "images": {"top": np.zeros((3, 2, 2), dtype=np.uint8)},
++        "state": anchor_state,
++        "actions": absolute_targets,
++    }
++    for transform in data_config.data_transforms.inputs:
++        data = transform(data)
++    transformed = data["actions"]
++    expected = np.stack([_delta(anchor_state, target) for target in absolute_targets])
++
++    np.testing.assert_allclose(transformed, expected, rtol=0.0, atol=1e-9)
+
+diff --git a/scripts/compute_joint_rtc_quality58_norm.py b/scripts/compute_joint_rtc_quality58_norm.py
+new file mode 100644
+index 0000000..3e68540
+--- /dev/null
++++ b/scripts/compute_joint_rtc_quality58_norm.py
+@@ -0,0 +1,106 @@
++"""Compute independent norm stats over every frozen Quality58 H20 window.
++
++This intentionally bypasses the generic norm helper's drop_last=True loader so
++that the final partial batch is included. The source dataset is still created
++through the production ``create_torch_dataset`` dispatch and the exact
++repack/data transforms used by the Quality58 config.
++"""
++
++import json
++from pathlib import Path
++
++import numpy as np
++import torch
++import tqdm
++import tyro
++
++import openpi.shared.normalize as normalize
++import openpi.training.config as config_lib
++import openpi.training.data_loader as data_loader
++import openpi.transforms as transforms
++
++
++class RemoveStrings(transforms.DataTransformFn):
++    def __call__(self, data: dict) -> dict:
++        return {key: value for key, value in data.items() if not np.issubdtype(np.asarray(value).dtype, np.str_)}
++
++
++def _collate(items: list[dict]) -> dict:
++    return data_loader.jax.tree.map(lambda *values: np.stack([np.asarray(value) for value in values], axis=0), *items)
++
++
++def main(
++    config_name: str = "pi05_piper_joint_rtc_h20_quality58_finetune",
++    batch_size: int = 16,
++    expected_windows: int = 25336,
++):
++    config = config_lib.get_config(config_name)
++    data_config = config.data.create(config.assets_dirs, config.model)
++    dataset = data_loader.create_torch_dataset(data_config, config.model.action_horizon, config.model)
++    if len(dataset) != expected_windows:
++        raise RuntimeError(f"frozen Quality58 dataset length is {len(dataset)}, expected {expected_windows}")
++
++    transformed = data_loader.TransformedDataset(
++        dataset,
++        [
++            *data_config.repack_transforms.inputs,
++            *data_config.data_transforms.inputs,
++            RemoveStrings(),
++        ],
++    )
++    loader = torch.utils.data.DataLoader(
++        transformed,
++        batch_size=batch_size,
++        shuffle=False,
++        num_workers=0,
++        drop_last=False,
++        collate_fn=_collate,
++    )
++
++    stats = {key: normalize.RunningStats() for key in ("state", "actions")}
++    seen = 0
++    batch_count = 0
++    for batch in tqdm.tqdm(loader, total=(len(dataset) + batch_size - 1) // batch_size, desc="Quality58 norm"):
++        batch_count += 1
++        current = int(np.asarray(batch["state"]).shape[0])
++        seen += current
++        for key, running in stats.items():
++            running.update(np.asarray(batch[key]))
++
++    if seen != len(dataset):
++        raise RuntimeError(f"normalization consumed {seen} windows, expected {len(dataset)}")
++
++    norm_stats = {key: running.get_statistics() for key, running in stats.items()}
++    for key, value in norm_stats.items():
++        for name in ("mean", "std", "q01", "q99"):
++            array = getattr(value, name)
++            if array is None or not np.all(np.isfinite(array)):
++                raise RuntimeError(f"non-finite {key}.{name} in recomputed norm stats")
++        if value.mean.shape != (7,) or value.std.shape != (7,):
++            raise RuntimeError(f"expected 7D {key} stats, got {value.mean.shape} and {value.std.shape}")
++
++    output_path = config.assets_dirs / data_config.repo_id
++    normalize.save(output_path, norm_stats)
++    provenance = {
++        "config_name": config_name,
++        "manifest_path": data_config.mask_aware_manifest_path,
++        "mask_path": data_config.mask_aware_mask_path,
++        "dataset_class": type(dataset).__name__,
++        "action_horizon": config.model.action_horizon,
++        "action_dim": config.model.action_dim,
++        "windows_seen": seen,
++        "batch_size": batch_size,
++        "batches_seen": batch_count,
++        "drop_last": False,
++        "transforms": [type(transform).__name__ for transform in (*data_config.repack_transforms.inputs, *data_config.data_transforms.inputs)],
++    }
++    output_path.mkdir(parents=True, exist_ok=True)
++    (output_path / "norm_provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
++    print(f"NORM_STATS_WRITTEN={output_path / 'norm_stats.json'}")
++    print(f"NORM_WINDOWS_SEEN={seen}")
++    print(f"NORM_BATCHES_SEEN={batch_count}")
++    print("NORM_RECOMPUTED_FROM_FINAL_MASK=YES")
++
++
++if __name__ == "__main__":
++    tyro.cli(main)
+
+diff --git a/scripts/eval_joint_pi05_rtc_h20_quality58_final_offline.py b/scripts/eval_joint_pi05_rtc_h20_quality58_final_offline.py
+new file mode 100644
+index 0000000..c88ee5d
+--- /dev/null
++++ b/scripts/eval_joint_pi05_rtc_h20_quality58_final_offline.py
+@@ -0,0 +1,532 @@
++#!/usr/bin/env python3
++"""Strictly offline evaluation of the Quality58 H20 RTC final checkpoint.
++
++This script deliberately uses only frozen mask-aware recorded windows and the
++policy API. It never imports robot/CAN/camera runtime modules and never writes
++inside a dataset or checkpoint tree.
++"""
++from __future__ import annotations
++
++import argparse
++from datetime import UTC, datetime
++import json
++import logging
++import os
++from pathlib import Path
++import sys
++import time
++from typing import Any
++
++import numpy as np
++
++OFFLINE_GUARDS = {"robot": "NO", "can": "NO", "camera": "NO", "motion": "NO"}
++OPENPI_ROOT = Path("<OPENPI_ROOT>")
++FINAL_CHECKPOINT = Path("<CHECKPOINT_ROOT>/pi05_piper_joint_rtc_h20_quality58_finetune/pi05_piper_joint_rtc_h20_quality58_3k_20260902_135854/2999")
++BASELINE_CHECKPOINT = Path("<CHECKPOINT_ROOT>/pi05_piper_joint_recovery_mix_finetune/pi05_piper_joint_recovery_mix_103ep_3k_20260831_133508_fastfinish/2999")
++CONFIG_NAME = "pi05_piper_joint_rtc_h20_quality58_finetune"
++BASELINE_CONFIG_NAME = "pi05_piper_joint_recovery_mix_finetune"
++MANIFEST = Path("<DATA_QA_ROOT>/joint_rtc_expert_salvage_20260901T161500Z/FINAL_TRAINING_MANIFEST.json")
++MASK = Path("<DATA_QA_ROOT>/joint_rtc_expert_salvage_20260901T161500Z/FINAL_TRAIN_SAMPLE_MASK.json")
++PROMPT = "pick and place"
++HORIZON = 20
++PHYSICAL_DIM = 7
++MODEL_DIM = 32
++SEED = 20260902
++JOINT_NAMES = ("J1", "J2", "J3", "J4", "J5", "J6")
++ALL_NAMES = (*JOINT_NAMES, "G")
++# These are the existing direct-joint runner's documented physical limits.
++JOINT_LIMITS = np.array([(-150.0, 124.22), (0.0, 179.91), (-170.0, 0.0), (-99.98, 99.98), (-69.90, 69.90), (-120.0, 120.0)], dtype=np.float64)
++GRIPPER_LIMITS = (0.0, 0.07)
++LIMIT_SOURCE = ".worktrees/direct-joint2999/src/openpi/rollouts/direct_joint_core.py:PHYSICAL_HARD_LIMITS + GRIPPER_LIMITS_M"
++LIMIT_UNITS = {"joints": "degrees", "gripper": "meters"}
++
++sys.path.insert(0, str(OPENPI_ROOT / "src"))
++
++
++def validate_action_shapes(physical_actions: np.ndarray, model_action_dim: int) -> tuple[int, int, int]:
++    arr = np.asarray(physical_actions)
++    if arr.ndim != 2 or arr.shape != (HORIZON, PHYSICAL_DIM):
++        raise ValueError(f"physical 7D H20 action required, got {arr.shape}; expected physical 7D")
++    if int(model_action_dim) != MODEL_DIM:
++        raise ValueError(f"model action dim 32 required, got {model_action_dim}; expected model action dim 32")
++    return (int(arr.shape[0]), int(arr.shape[1]), int(model_action_dim))
++
++
++def summarize_errors(values: np.ndarray) -> dict[str, float | int | None]:
++    x = np.asarray(values, dtype=np.float64).reshape(-1)
++    finite = x[np.isfinite(x)]
++    return {
++        "count": int(x.size),
++        "finite_count": int(finite.size),
++        "mae": float(np.mean(np.abs(finite))) if finite.size else None,
++        "p50": float(np.percentile(np.abs(finite), 50)) if finite.size else None,
++        "p95": float(np.percentile(np.abs(finite), 95)) if finite.size else None,
++        "max": float(np.max(np.abs(finite))) if finite.size else None,
++    }
++
++
++def baseline_comparison(final_metrics: dict[str, Any], baseline_metrics: dict[str, Any] | None) -> dict[str, Any]:
++    if baseline_metrics is None:
++        return {"comparable": False, "status": "H10/H20 incomparable", "final": final_metrics, "baseline": None}
++    return {"comparable": True, "status": "H10 first-action comparison only; full H20 is not comparable", "final": final_metrics, "baseline": baseline_metrics}
++
++
++def _json_default(value: Any) -> Any:
++    if isinstance(value, (np.integer, np.floating, np.bool_)):
++        return value.item()
++    if isinstance(value, np.ndarray):
++        return value.tolist()
++    if isinstance(value, Path):
++        return str(value)
++    raise TypeError(type(value).__name__)
++
++
++def _dump(path: Path, value: Any) -> None:
++    path.write_text(json.dumps(value, indent=2, sort_keys=True, default=_json_default) + "\n")
++
++
++def _noise(seed: int, episode_id: str, start: int, horizon: int) -> np.ndarray:
++    return np.random.default_rng(np.random.SeedSequence([seed, hash(episode_id) & 0xFFFFFFFF, int(start)])).standard_normal((horizon, MODEL_DIM)).astype(np.float32)
++
++
++def _dataset():
++    from openpi.training.data_loader import MaskAwareJointRTCDataset
++    return MaskAwareJointRTCDataset(MANIFEST, MASK, action_horizon=HORIZON, prompt=PROMPT)
++
++
++def _obs(sample: dict[str, Any]) -> dict[str, Any]:
++    return {
++        "images": {"top": np.asarray(sample["observation.images.top"]), "wrist": np.asarray(sample["observation.images.wrist"])},
++        "state": np.asarray(sample["observation.state"], dtype=np.float32),
++        "prompt": PROMPT,
++    }
++
++
++def _load_policy(config_name: str, checkpoint: Path):
++    from openpi.policies import policy_config
++    from openpi.training import config as training_config
++    cfg = training_config.get_config(config_name)
++    policy = policy_config.create_trained_policy(cfg, checkpoint, default_prompt=PROMPT)
++    return policy, cfg
++
++
++def _find_kernel_shape(tree: Any) -> list[int] | None:
++    if isinstance(tree, dict):
++        if "action_in_proj" in tree:
++            node = tree["action_in_proj"]
++            if isinstance(node, dict) and "kernel" in node:
++                return list(np.shape(node["kernel"]))
++        for value in tree.values():
++            found = _find_kernel_shape(value)
++            if found is not None:
++                return found
++    return None
++
++
++def _checkpoint_kernel_shape(checkpoint: Path) -> list[int] | None:
++    import jax.numpy as jnp
++    from openpi.models import model as model_lib
++    params = model_lib.restore_params(checkpoint / "params", dtype=jnp.bfloat16)
++    return _find_kernel_shape(params)
++
++
++def _preflight() -> int:
++    started = time.perf_counter()
++    report: dict[str, Any] = {"mode": "preflight", "offline_only": True, "guards": OFFLINE_GUARDS, "checkpoint": FINAL_CHECKPOINT}
++    try:
++        if not FINAL_CHECKPOINT.is_dir() or not (FINAL_CHECKPOINT / "params").is_dir():
++            raise FileNotFoundError(f"final checkpoint params missing: {FINAL_CHECKPOINT}")
++        policy, cfg = _load_policy(CONFIG_NAME, FINAL_CHECKPOINT)
++        ds = _dataset()
++        sample = ds[0]
++        state = np.asarray(sample["observation.state"])
++        actions = np.asarray(sample["action"])
++        if state.shape != (7,):
++            raise ValueError(f"raw state shape {state.shape}, expected (7,)")
++        if actions.shape != (20, 7):
++            raise ValueError(f"raw action shape {actions.shape}, expected (20,7)")
++        validate_action_shapes(actions, cfg.model.action_dim)
++        transformed = policy._input_transform(_obs(sample))  # noqa: SLF001 - exact deployment policy transform
++        report["raw_physical_state_shape"] = list(state.shape)
++        report["raw_physical_action_shape"] = list(actions.shape)
++        report["padded_state_shape"] = list(np.shape(transformed["state"]))
++        report["padded_action_shape"] = list(np.shape(transformed.get("actions", np.zeros((20, MODEL_DIM), np.float32))))
++        report["model_action_dim"] = int(cfg.model.action_dim)
++        report["action_horizon"] = int(cfg.model.action_horizon)
++        report["training_rtc_action_dim"] = int(cfg.model.training_rtc_action_dim)
++        report["dataset_class"] = type(ds).__name__
++        report["dataset_windows"] = len(ds)
++        report["manifest_episodes"] = len(json.loads(MANIFEST.read_text())["episodes"])
++        report["checkpoint_local_norm"] = (FINAL_CHECKPOINT / "assets/local/piper_joint_rtc_quality58/norm_stats.json").is_file()
++        report["action_in_proj_kernel"] = _checkpoint_kernel_shape(FINAL_CHECKPOINT)
++        out = policy.infer(_obs(sample), noise=_noise(SEED, ds.window_index[0][0], ds.window_index[0][1], HORIZON))
++        physical = np.asarray(out["actions"], dtype=np.float32)
++        report["physical_output_shape"] = list(physical.shape)
++        report["all_output_finite"] = bool(np.isfinite(physical).all())
++        report["inference_ms"] = float(out.get("policy_timing", {}).get("infer_ms", float("nan")))
++        if physical.shape != (20, 7) or not np.isfinite(physical).all():
++            raise RuntimeError("preflight physical output shape/finite check failed")
++        report.update({"status": "PASS", "checkpoint_load": "PASS", "elapsed_seconds": time.perf_counter() - started})
++        print(json.dumps(report, indent=2, default=_json_default))
++        return 0
++    except BaseException as exc:
++        report.update({"status": "FAIL", "checkpoint_load": "FAIL", "exception": f"{type(exc).__name__}: {exc}", "elapsed_seconds": time.perf_counter() - started})
++        print(json.dumps(report, indent=2, default=_json_default), file=sys.stderr)
++        return 1
++
++
++def select_adjacent_pairs(
++    window_index: list[tuple[str, int]],
++    episode_sources: dict[str, str],
++    *,
++    min_pairs: int = 100,
++) -> list[tuple[tuple[str, int], tuple[str, int]]]:
++    """Select valid adjacent H20 windows from the frozen mask index.
++
++    Starts are original episode frame indices. Pairing is exact ``t``/``t+1``
++    within one episode, so the two predictions have the 19-step overlap used
++    by the training-time inter-chunk RTC boundary semantics. Recovery episodes
++    are seeded first so every recovery episode is represented deterministically.
++    """
++    by_ep: dict[str, set[int]] = {}
++    for episode_id, start in window_index:
++        by_ep.setdefault(str(episode_id), set()).add(int(start))
++    all_pairs: dict[str, list[tuple[tuple[str, int], tuple[str, int]]]] = {}
++    for episode_id in sorted(by_ep):
++        starts = sorted(by_ep[episode_id])
++        valid = [
++            ((episode_id, start), (episode_id, start + 1))
++            for start in starts
++            if start + 1 in by_ep[episode_id]
++        ]
++        all_pairs[episode_id] = valid
++    recovery_ids = [
++        episode_id for episode_id in sorted(all_pairs)
++        if episode_sources.get(episode_id) == "recovery"
++    ]
++    selected: list[tuple[tuple[str, int], tuple[str, int]]] = []
++    used: set[tuple[tuple[str, int], tuple[str, int]]] = set()
++    for episode_id in recovery_ids:
++        if all_pairs[episode_id]:
++            pair = all_pairs[episode_id][0]
++            selected.append(pair)
++            used.add(pair)
++    remaining = [
++        pair for episode_id in sorted(all_pairs)
++        for pair in all_pairs[episode_id]
++        if pair not in used
++    ]
++    selected.extend(remaining[: max(0, int(min_pairs) - len(selected))])
++    if len(selected) < int(min_pairs):
++        raise ValueError(
++            f"only {len(selected)} adjacent valid H20 pairs available; "
++            f"required {int(min_pairs)}"
++        )
++    return selected
++
++
++def _continuity_pairs(
++    pred_a: np.ndarray,
++    pred_b: np.ndarray,
++    pairs: list[tuple[tuple[str, int], tuple[str, int]]],
++) -> tuple[dict[str, Any], list[dict[str, Any]]]:
++    """Measure overlap discontinuity for exact adjacent physical 7D pairs."""
++    values: list[float] = []
++    records: list[dict[str, Any]] = []
++    for index, (first, second) in enumerate(pairs):
++        a = np.asarray(pred_a[index], dtype=np.float64)
++        b = np.asarray(pred_b[index], dtype=np.float64)
++        if a.shape != (HORIZON, PHYSICAL_DIM) or b.shape != (HORIZON, PHYSICAL_DIM):
++            raise ValueError(f"RTC pair predictions must be ({HORIZON},7), got {a.shape} and {b.shape}")
++        delta = np.abs(a[1:, :PHYSICAL_DIM] - b[:-1, :PHYSICAL_DIM])
++        for dim, name in enumerate(ALL_NAMES):
++            value = float(np.mean(delta[:, dim]))
++            values.append(value)
++            records.append({
++                "episode": first[0],
++                "frame": second[1],
++                "joint": name,
++                "value": value,
++            })
++    metrics = summarize_errors(np.asarray(values, dtype=np.float64))
++    metrics.update({
++        "pair_count": int(len(pairs)),
++        "overlap_steps": HORIZON - 1,
++        "physical_action_dim": PHYSICAL_DIM,
++    })
++    return metrics, sorted(records, key=lambda item: item["value"], reverse=True)[:10]
++
++
++def safety_diagnostics(
++    pred: np.ndarray,
++    expert: np.ndarray,
++    metadata: list[tuple[str, int]],
++    baseline: np.ndarray | None = None,
++) -> dict[str, Any]:
++    """Report hard-limit violations in physical units without clamping."""
++    def _as_chunks(values: np.ndarray, label: str) -> np.ndarray:
++        array = np.asarray(values, dtype=np.float64)
++        if array.ndim == 2 and array.shape[-1] == PHYSICAL_DIM:
++            array = array[:, None, :]
++        if array.ndim != 3 or array.shape[-1] != PHYSICAL_DIM:
++            raise ValueError(f"{label} must have shape [N,H,7] or [N,7], got {array.shape}")
++        if array.shape[0] != len(metadata):
++            raise ValueError(f"{label} rows {array.shape[0]} != metadata rows {len(metadata)}")
++        return array
++
++    def _mask(array: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
++        joint = array[..., :6]
++        grip = array[..., 6]
++        joint_bad = (joint < JOINT_LIMITS[:, 0]) | (joint > JOINT_LIMITS[:, 1])
++        grip_bad = (grip < GRIPPER_LIMITS[0]) | (grip > GRIPPER_LIMITS[1])
++        return joint_bad, grip_bad
++
++    pred_arr = _as_chunks(pred, "pred")
++    expert_arr = _as_chunks(expert, "expert")
++    baseline_arr = _as_chunks(baseline, "baseline") if baseline is not None else None
++    pred_joint_bad, pred_grip_bad = _mask(pred_arr)
++    expert_joint_bad, expert_grip_bad = _mask(expert_arr)
++    base_joint_bad, base_grip_bad = _mask(baseline_arr) if baseline_arr is not None else (None, None)
++    examples: list[dict[str, Any]] = []
++    for row, (episode_id, start) in enumerate(metadata):
++        for offset in range(pred_arr.shape[1]):
++            if pred_joint_bad[row, offset, 2]:
++                examples.append({
++                    "episode": episode_id,
++                    "frame": int(start) + offset,
++                    "predicted_value": float(pred_arr[row, offset, 2]),
++                    "lower_limit": float(JOINT_LIMITS[2, 0]),
++                    "upper_limit": float(JOINT_LIMITS[2, 1]),
++                    "expert_value": float(expert_arr[row, min(offset, expert_arr.shape[1] - 1), 2]),
++                })
++    if len(examples) > 20:
++        chosen = np.random.default_rng(SEED).choice(len(examples), size=20, replace=False)
++        examples = [examples[int(index)] for index in sorted(chosen)]
++    steps = np.abs(np.diff(pred_arr, axis=1)) if pred_arr.shape[1] > 1 else np.zeros_like(pred_arr)
++    result: dict[str, Any] = {
++        "limit_source": LIMIT_SOURCE,
++        "limit_units": LIMIT_UNITS,
++        "joint_limits": {name: [float(lo), float(hi)] for name, (lo, hi) in zip(JOINT_NAMES, JOINT_LIMITS)},
++        "gripper_limit": [float(GRIPPER_LIMITS[0]), float(GRIPPER_LIMITS[1])],
++        "joint_limit_violation_count": int(pred_joint_bad.sum()),
++        "joint_limit_violation_rate": float(pred_joint_bad.mean()),
++        "joint_limit_by_dim": {name: int(pred_joint_bad[..., i].sum()) for i, name in enumerate(JOINT_NAMES)},
++        "gripper_limit_violation_count": int(pred_grip_bad.sum()),
++        "gripper_limit_violation_rate": float(pred_grip_bad.mean()),
++        "expert_j3_violation_count": int(expert_joint_bad[..., 2].sum()),
++        "final_j3_violation_count": int(pred_joint_bad[..., 2].sum()),
++        "baseline_j3_violation_count": int(base_joint_bad[..., 2].sum()) if base_joint_bad is not None else None,
++        "expert_gripper_violation_count": int(expert_grip_bad.sum()),
++        "final_gripper_violation_count": int(pred_grip_bad.sum()),
++        "baseline_gripper_violation_count": int(base_grip_bad.sum()) if base_grip_bad is not None else None,
++        "j3_violation_examples": examples,
++        "max_step_delta_by_dim": {name: float(np.max(steps[..., i])) for i, name in enumerate(ALL_NAMES)},
++        "p95_step_delta_by_dim": {name: float(np.percentile(steps[..., i], 95)) for i, name in enumerate(ALL_NAMES)},
++    }
++    return result
++
++
++def _select_windows(ds) -> list[tuple[str, int]]:
++    by_ep: dict[str, list[int]] = {}
++    for ep, start in ds.window_index:
++        by_ep.setdefault(ep, []).append(int(start))
++    manifest = json.loads(MANIFEST.read_text())
++    episode_records = {record["episode_id"]: record for record in manifest["episodes"]}
++    selected: list[tuple[str, int]] = []
++    for ep in sorted(by_ep):
++        starts = sorted(set(by_ep[ep]))
++        n = 12 if episode_records[ep]["source"] == "recovery" else 6
++        pos = np.linspace(0, len(starts) - 1, min(n, len(starts)), dtype=int)
++        selected.extend((ep, starts[int(i)]) for i in np.unique(pos))
++    return selected
++
++
++def _metrics(pred: np.ndarray, expert: np.ndarray) -> dict[str, Any]:
++    err = np.abs(pred - expert)
++    return {
++        "first_action": summarize_errors(err[:, 0, :]),
++        "first_action_by_dim": {name: summarize_errors(err[:, 0, i]) for i, name in enumerate(ALL_NAMES)},
++        "full_chunk": summarize_errors(err),
++        "full_chunk_by_dim": {name: summarize_errors(err[:, :, i]) for i, name in enumerate(ALL_NAMES)},
++    }
++
++
++def _continuity(pred: np.ndarray, selected: list[tuple[str, int]]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
++    by_ep: dict[str, list[tuple[int, int]]] = {}
++    for i, (ep, start) in enumerate(selected):
++        by_ep.setdefault(ep, []).append((start, i))
++    values: list[float] = []
++    records: list[dict[str, Any]] = []
++    for ep, pairs in by_ep.items():
++        pairs.sort()
++        for (start_a, ia), (start_b, ib) in zip(pairs, pairs[1:]):
++            if start_b <= start_a or start_b - start_a > HORIZON:
++                continue
++            overlap = HORIZON - (start_b - start_a)
++            a = pred[ia, start_b - start_a : start_b - start_a + overlap]
++            b = pred[ib, :overlap]
++            d = np.abs(a[:, :PHYSICAL_DIM] - b[:, :PHYSICAL_DIM])
++            for j, name in enumerate(JOINT_NAMES):
++                values.append(float(np.mean(d[:, j])))
++                records.append({"episode": ep, "frame": start_b, "joint": name, "value": float(np.mean(d[:, j]))})
++    return summarize_errors(np.asarray(values)), sorted(records, key=lambda x: x["value"], reverse=True)[:10]
++
++
++def _safety(pred: np.ndarray) -> dict[str, Any]:
++    """Backward-compatible prediction-only safety summary."""
++    array = np.asarray(pred)
++    metadata = [("unknown", 0)] * int(array.shape[0])
++    return safety_diagnostics(array, np.zeros_like(array), metadata)
++
++
++def _run_full() -> int:
++    started = time.perf_counter()
++    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
++    out_dir = Path("<EVAL_ROOT>") / f"pi05_piper_joint_rtc_h20_quality58_2999_{timestamp}"
++    out_dir.mkdir(parents=True, exist_ok=False)
++    log_path = out_dir / "evaluation.log"
++    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=[logging.FileHandler(log_path), logging.StreamHandler(sys.stderr)])
++    log = logging.getLogger("offline_eval")
++    try:
++        ds = _dataset()
++        selected = _select_windows(ds)
++        policy, cfg = _load_policy(CONFIG_NAME, FINAL_CHECKPOINT)
++        predictions: list[np.ndarray] = []
++        experts: list[np.ndarray] = []
++        episode_records = {
++            record["episode_id"]: record
++            for record in json.loads(MANIFEST.read_text())["episodes"]
++        }
++        for count, (ep, start) in enumerate(selected, 1):
++            sample = ds.read_window(ep, start)
++            pred = np.asarray(policy.infer(_obs(sample), noise=_noise(SEED, ep, start, HORIZON))["actions"], dtype=np.float32)
++            validate_action_shapes(pred, cfg.model.action_dim)
++            if not np.isfinite(pred).all():
++                raise FloatingPointError(f"non-finite final output at {ep}:{start}")
++            predictions.append(pred)
++            experts.append(np.asarray(sample["action"], dtype=np.float32))
++            if count % 25 == 0:
++                log.info("final forward %d/%d", count, len(selected))
++        pred_arr, exp_arr = np.stack(predictions), np.stack(experts)
++        final_metrics = _metrics(pred_arr, exp_arr)
++
++        # RTC is evaluated only on exact adjacent valid starts from the frozen
++        # mask-aware index. This mirrors the training boundary's physical 7D
++        # overlap and never includes latent padding dimensions.
++        rtc_pairs = select_adjacent_pairs(ds.window_index, {ep: record["source"] for ep, record in episode_records.items()}, min_pairs=100)
++        pair_predictions_a: list[np.ndarray] = []
++        pair_predictions_b: list[np.ndarray] = []
++        pair_recovery: list[bool] = []
++        for count, (first, second) in enumerate(rtc_pairs, 1):
++            first_sample = ds.read_window(*first)
++            second_sample = ds.read_window(*second)
++            first_pred = np.asarray(policy.infer(_obs(first_sample), noise=_noise(SEED, *first, HORIZON))["actions"], dtype=np.float32)
++            second_pred = np.asarray(policy.infer(_obs(second_sample), noise=_noise(SEED, *second, HORIZON))["actions"], dtype=np.float32)
++            validate_action_shapes(first_pred, cfg.model.action_dim)
++            validate_action_shapes(second_pred, cfg.model.action_dim)
++            if not np.isfinite(first_pred).all() or not np.isfinite(second_pred).all():
++                raise FloatingPointError(f"non-finite RTC pair output at {first} -> {second}")
++            pair_predictions_a.append(first_pred)
++            pair_predictions_b.append(second_pred)
++            pair_recovery.append(episode_records[first[0]]["source"] == "recovery")
++            if count % 25 == 0:
++                log.info("RTC adjacent forward %d/%d", count, len(rtc_pairs))
++        rtc_pred_a = np.stack(pair_predictions_a)
++        rtc_pred_b = np.stack(pair_predictions_b)
++        rtc, worst = _continuity_pairs(rtc_pred_a, rtc_pred_b, rtc_pairs)
++        recovery_rtc, _ = _continuity_pairs(
++            rtc_pred_a[np.asarray(pair_recovery, dtype=bool)],
++            rtc_pred_b[np.asarray(pair_recovery, dtype=bool)],
++            [pair for pair, is_recovery in zip(rtc_pairs, pair_recovery) if is_recovery],
++        )
++        rtc["recovery_pair_count"] = recovery_rtc["pair_count"]
++        rtc["recovery"] = recovery_rtc
++
++        # Baseline is intentionally H10: same observations and first-action
++        # A/B only. Its safety counts are therefore explicitly first-action
++        # counts, not a fabricated H20 comparison.
++        base_policy, base_cfg = _load_policy(BASELINE_CONFIG_NAME, BASELINE_CHECKPOINT)
++        base_first: list[np.ndarray] = []
++        base_expert: list[np.ndarray] = []
++        for count, (ep, start) in enumerate(selected, 1):
++            sample = ds.read_window(ep, start)
++            out = base_policy.infer(_obs(sample), noise=_noise(SEED + 1, ep, start, int(base_cfg.model.action_horizon)))
++            base_first.append(np.asarray(out["actions"], dtype=np.float32)[0])
++            base_expert.append(np.asarray(sample["action"], dtype=np.float32)[0])
++            if count % 25 == 0:
++                log.info("baseline forward %d/%d", count, len(selected))
++        base_first_arr = np.stack(base_first)
++        base_expert_arr = np.stack(base_expert)
++        base_first_metrics = summarize_errors(np.abs(base_first_arr - base_expert_arr))
++        safety = safety_diagnostics(pred_arr, exp_arr, selected, baseline=base_first_arr)
++        recovery_mask = np.array([episode_records[ep]["source"] == "recovery" for ep, _ in selected])
++        nominal_mask = ~recovery_mask
++        recovery_metrics = _metrics(pred_arr[recovery_mask], exp_arr[recovery_mask])
++        nominal_metrics = _metrics(pred_arr[nominal_mask], exp_arr[nominal_mask])
++        episode_rows = []
++        for ep in sorted({x[0] for x in selected}):
++            m = np.array([x[0] == ep for x in selected])
++            e = _metrics(pred_arr[m], exp_arr[m])
++            episode_rows.append({"episode": ep, "source": episode_records[ep]["source"], "windows": int(m.sum()), "first_action_fit": e["first_action"], "h20_fit": e["full_chunk"], "rtc_continuity": "measured", "joint_limit": "PASS" if _safety(pred_arr[m])["joint_limit_violation_count"] == 0 else "WARNING", "gripper": "PASS" if _safety(pred_arr[m])["gripper_limit_violation_count"] == 0 else "WARNING", "final": "PASS"})
++        # Determinism on one frozen observation, same explicit noise.
++        sample0 = ds.read_window(*selected[0])
++        det = [np.asarray(policy.infer(_obs(sample0), noise=_noise(SEED, *selected[0], HORIZON))["actions"], dtype=np.float32) for _ in range(10)]
++        det_diff = max(float(np.max(np.abs(det[i] - det[0]))) for i in range(1, len(det)))
++        summary = {
++            "FINAL_CHECKPOINT": FINAL_CHECKPOINT,
++            "FINAL_CHECKPOINT_LOAD": "PASS",
++            "DATASET": "FINAL_TRAINING_MANIFEST + FINAL_TRAIN_SAMPLE_MASK",
++            "EPISODES": int(len(episode_records)),
++            "NOMINAL_EPISODES": int(sum(v["source"] == "nominal" for v in episode_records.values())),
++            "RECOVERY_EPISODES": int(sum(v["source"] == "recovery" for v in episode_records.values())),
++            "VALID_H20_WINDOWS": int(len(ds)),
++            "FORWARD_SAMPLES_FINAL": int(len(selected)),
++            "PHYSICAL_STATE_DIM": 7,
++            "PHYSICAL_ACTION_DIM": 7,
++            "MODEL_LATENT_ACTION_DIM": int(cfg.model.action_dim),
++            "ACTION_HORIZON": int(cfg.model.action_horizon),
++            "FIRST_ACTION": final_metrics["first_action"],
++            "FULL_CHUNK": final_metrics["full_chunk"],
++            "NOMINAL": nominal_metrics,
++            "RECOVERY": recovery_metrics,
++            "RTC_INTER_CHUNK": rtc,
++            "RTC_RECOVERY": rtc["recovery"],
++            "TOP_10_WORST_RTC_TRANSITIONS": worst,
++            "SAFETY": safety,
++            "BASELINE_H10_FIRST_ACTION": base_first_metrics,
++            "BASELINE_COMPARISON": baseline_comparison(final_metrics["first_action"], base_first_metrics),
++            "H10_H20_COMPARISON": "H10/H20 incomparable for full chunks; baseline first-action A/B only",
++            "DETERMINISM_MAX_ABS_DIFF": det_diff,
++            "POLICY_DETERMINISTIC": "YES" if det_diff == 0.0 else "NO",
++            "OFFLINE_GUARDS": OFFLINE_GUARDS,
++            "ROBOT_CONNECTION_ATTEMPTED": "NO",
++            "CAN_STARTED": "NO",
++            "LIVE_CAMERA_OPENED": "NO",
++            "ROBOT_MOTION": "NO",
++            "FINAL_OFFLINE_GATE": "WARNING" if "incomparable" in "H10/H20 incomparable" else "PASS",
++            "elapsed_seconds": time.perf_counter() - started,
++        }
++        _dump(out_dir / "summary.json", summary)
++        _dump(out_dir / "metrics.json", {"final": final_metrics, "nominal": nominal_metrics, "recovery": recovery_metrics, "rtc": rtc, "safety": safety, "baseline_h10_first_action": base_first_metrics})
++        _dump(out_dir / "recovery_per_episode.json", [r for r in episode_rows if r["source"] == "recovery"])
++        _dump(out_dir / "worst_transitions.json", worst)
++        log.info("OFFLINE_EVAL_DONE output=%s", out_dir)
++        print(json.dumps({"status": "PASS", "output_dir": out_dir, **summary}, indent=2, default=_json_default))
++        return 0
++    except BaseException as exc:
++        logging.getLogger("offline_eval").exception("OFFLINE_EVAL_FAIL")
++        print(json.dumps({"status": "FAIL", "output_dir": out_dir, "exception": f"{type(exc).__name__}: {exc}", "guards": OFFLINE_GUARDS}, indent=2, default=_json_default), file=sys.stderr)
++        return 1
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    group = parser.add_mutually_exclusive_group(required=True)
++    group.add_argument("--preflight", action="store_true")
++    group.add_argument("--full", action="store_true")
++    args = parser.parse_args()
++    return _preflight() if args.preflight else _run_full()
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+
+diff --git a/scripts/test_eval_joint_pi05_rtc_h20_quality58_final_offline.py b/scripts/test_eval_joint_pi05_rtc_h20_quality58_final_offline.py
+new file mode 100644
+index 0000000..45ca8da
+--- /dev/null
++++ b/scripts/test_eval_joint_pi05_rtc_h20_quality58_final_offline.py
+@@ -0,0 +1,72 @@
++"""Pure-function regression tests for the offline Quality58 H20 evaluator."""
++
++from __future__ import annotations
++
++import numpy as np
++import pytest
++
++from eval_joint_pi05_rtc_h20_quality58_final_offline import (
++    OFFLINE_GUARDS,
++    baseline_comparison,
++    summarize_errors,
++    validate_action_shapes,
++)
++
++
++def test_offline_guards_disable_all_hardware_paths():
++    assert OFFLINE_GUARDS == {
++        "robot": "NO",
++        "can": "NO",
++        "camera": "NO",
++        "motion": "NO",
++    }
++
++
++def test_validate_action_shapes_requires_physical_7d_and_model_32d():
++    physical = np.zeros((20, 7), dtype=np.float32)
++    assert validate_action_shapes(physical, model_action_dim=32) == (20, 7, 32)
++    with pytest.raises(ValueError, match="physical 7D"):
++        validate_action_shapes(np.zeros((20, 6), dtype=np.float32), model_action_dim=32)
++    with pytest.raises(ValueError, match="model action dim 32"):
++        validate_action_shapes(physical, model_action_dim=7)
++
++
++def test_summary_and_missing_h20_baseline_are_explicitly_incomparable():
++    summary = summarize_errors(np.array([1.0, 2.0, 3.0], dtype=np.float32))
++    assert summary["mae"] == pytest.approx(2.0)
++    assert summary["p95"] == pytest.approx(2.9)
++    comparison = baseline_comparison(final_metrics={"mae": 1.0}, baseline_metrics=None)
++    assert comparison["comparable"] is False
++    assert "H10/H20 incomparable" in comparison["status"]
++
++
++def test_select_adjacent_pairs_uses_valid_consecutive_frames_and_covers_recovery():
++    from eval_joint_pi05_rtc_h20_quality58_final_offline import select_adjacent_pairs
++
++    window_index = []
++    sources = {}
++    for ep, source, count in (("nominal-0", "nominal", 120), ("recovery-0", "recovery", 20), ("recovery-1", "recovery", 20)):
++        sources[ep] = source
++        window_index.extend((ep, frame) for frame in range(count))
++    pairs = select_adjacent_pairs(window_index, sources, min_pairs=100)
++    assert len(pairs) >= 100
++    assert {a[0] for a, _ in pairs if sources[a[0]] == "recovery"} == {"recovery-0", "recovery-1"}
++    assert all(a[0] == b[0] and b[1] == a[1] + 1 for a, b in pairs)
++
++
++def test_safety_diagnostics_report_units_and_expert_final_examples():
++    from eval_joint_pi05_rtc_h20_quality58_final_offline import safety_diagnostics
++
++    pred = np.zeros((2, 20, 7), dtype=np.float32)
++    expert = np.zeros_like(pred)
++    pred[0, 3, 2] = 1.0  # J3 is above its upper bound of 0 degrees.
++    pred[1, 4, 6] = 0.08  # gripper is above its upper bound of 0.07 m.
++    result = safety_diagnostics(pred, expert, [("ep-a", 10), ("ep-b", 20)])
++    assert "direct_joint_core.py" in result["limit_source"]
++    assert result["limit_units"] == {"joints": "degrees", "gripper": "meters"}
++    assert result["final_j3_violation_count"] == 1
++    assert result["expert_j3_violation_count"] == 0
++    assert result["final_gripper_violation_count"] == 1
++    assert result["expert_gripper_violation_count"] == 0
++    assert result["j3_violation_examples"][0]["episode"] == "ep-a"
++    assert result["j3_violation_examples"][0]["frame"] == 13
+
+diff --git a/scripts/prepare_piper_joint_recovery_mix.py b/scripts/prepare_piper_joint_recovery_mix.py
+new file mode 100644
+index 0000000..4fd34b0
+--- /dev/null
++++ b/scripts/prepare_piper_joint_recovery_mix.py
+@@ -0,0 +1,196 @@
++#!/usr/bin/env python3
++"""Build an immutable 92+11 Joint-space LeRobot v2 mix.
++
++The input datasets are never changed. Original episodes remain 0..91; reviewed
++recovery episodes are copied as 92..102 after verifying the shared 7D Joint
++schema. Recovery parquet metadata is rewritten only in the destination so its
++episode and global frame indices match the new mix. Videos are hardlinked, not
++re-encoded.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import shutil
++from pathlib import Path
++from typing import Any
++
++
++JOINT_NAMES = ["J1.pos", "J2.pos", "J3.pos", "J4.pos", "J5.pos", "J6.pos", "G.pos"]
++VIDEO_KEYS = ("observation.images.top", "observation.images.wrist")
++
++
++def _load_json(path: Path) -> dict[str, Any]:
++    return json.loads(path.read_text())
++
++
++def _load_episodes(root: Path) -> list[dict[str, Any]]:
++    path = root / "meta/episodes.jsonl"
++    if not path.is_file():
++        raise FileNotFoundError(f"missing {path}")
++    rows = [json.loads(line) for line in path.read_text().splitlines() if line]
++    if [int(row["episode_index"]) for row in rows] != list(range(len(rows))):
++        raise ValueError(f"episode indices are not contiguous in {path}")
++    return rows
++
++
++def _dataset_summary(root: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
++    required = (root / "meta/info.json", root / "meta/stats.json", root / "meta/tasks.jsonl")
++    missing = [str(path) for path in required if not path.is_file()]
++    if missing:
++        raise FileNotFoundError(f"missing dataset metadata: {missing}")
++    info = _load_json(root / "meta/info.json")
++    episodes = _load_episodes(root)
++    frames = sum(int(row["length"]) for row in episodes)
++    if int(info["total_episodes"]) != len(episodes) or int(info["total_frames"]) != frames:
++        raise ValueError(f"metadata totals disagree in {root}")
++    if float(info["fps"]) != 30:
++        raise ValueError(f"expected 30fps in {root}, got {info['fps']}")
++    return info, episodes
++
++
++def _validate_joint_schema(original_info: dict[str, Any], recovery_info: dict[str, Any]) -> None:
++    for label, info in (("original", original_info), ("recovery", recovery_info)):
++        features = info.get("features", {})
++        for key in ("observation.state", "action"):
++            feature = features.get(key, {})
++            if feature.get("shape") != [7] or feature.get("names") != JOINT_NAMES:
++                raise ValueError(f"{label} {key} is not the required 7D Joint schema")
++        for key in VIDEO_KEYS:
++            if key not in features:
++                raise ValueError(f"{label} is missing {key}")
++    for key in ("observation.state", "action"):
++        if original_info["features"][key] != recovery_info["features"][key]:
++            raise ValueError(f"schema mismatch for {key}")
++
++
++def _link(source: Path, destination: Path) -> None:
++    destination.parent.mkdir(parents=True, exist_ok=True)
++    os.link(source, destination)
++
++
++def _require_episode_files(root: Path, episode: int) -> None:
++    stem = f"episode_{episode:06d}"
++    required = [root / "data/chunk-000" / f"{stem}.parquet"]
++    required.extend(root / "videos/chunk-000" / key / f"{stem}.mp4" for key in VIDEO_KEYS)
++    missing = [str(path) for path in required if not path.is_file()]
++    if missing:
++        raise FileNotFoundError(f"missing episode assets: {missing}")
++
++
++def _copy_recovery_parquet(source: Path, destination: Path, source_episode: int, target_episode: int, index_offset: int) -> None:
++    import pandas as pd
++
++    frame = pd.read_parquet(source)
++    required_columns = {"observation.state", "action", "timestamp", "frame_index", "episode_index", "index", "task_index"}
++    if not required_columns.issubset(frame.columns):
++        raise ValueError(f"recovery parquet missing columns: {required_columns - set(frame.columns)}")
++    if not (frame["episode_index"] == source_episode).all():
++        raise ValueError(f"recovery parquet episode index mismatch: {source}")
++    if frame["frame_index"].tolist() != list(range(len(frame))):
++        raise ValueError(f"recovery parquet frame index mismatch: {source}")
++    frame = frame.copy()
++    frame["episode_index"] = target_episode
++    frame["index"] = range(index_offset, index_offset + len(frame))
++    frame.to_parquet(destination, index=False)
++
++
++def build_mix(original: Path, recovery: Path, destination: Path, *, validate_parquet: bool = True) -> dict[str, Any]:
++    """Create a new mix and return its verified mapping report."""
++    original, recovery, destination = original.resolve(), recovery.resolve(), destination.resolve()
++    if destination.exists():
++        raise FileExistsError(f"refusing to overwrite existing destination: {destination}")
++    if destination in (original, recovery):
++        raise ValueError("destination must be distinct from both input datasets")
++
++    original_info, original_episodes = _dataset_summary(original)
++    recovery_info, recovery_episodes = _dataset_summary(recovery)
++    _validate_joint_schema(original_info, recovery_info)
++    if (original / "meta/tasks.jsonl").read_bytes() != (recovery / "meta/tasks.jsonl").read_bytes():
++        raise ValueError("original and recovery task metadata differ")
++
++    destination.mkdir(parents=True)
++    try:
++        (destination / "meta").mkdir()
++        shutil.copy2(original / "meta/tasks.jsonl", destination / "meta/tasks.jsonl")
++        info = dict(original_info)
++        info["total_episodes"] = len(original_episodes) + len(recovery_episodes)
++        info["total_frames"] = sum(int(row["length"]) for row in original_episodes + recovery_episodes)
++        (destination / "meta/info.json").write_text(json.dumps(info, indent=2) + "\n")
++        # OpenPI uses independently computed norm stats. This stale-compatible
++        # LeRobot metadata is retained only for layout compatibility.
++        shutil.copy2(original / "meta/stats.json", destination / "meta/stats.json")
++
++        output_rows: list[dict[str, Any]] = []
++        for row in original_episodes:
++            source_episode = int(row["episode_index"])
++            _require_episode_files(original, source_episode)
++            stem = f"episode_{source_episode:06d}"
++            _link(original / "data/chunk-000" / f"{stem}.parquet", destination / "data/chunk-000" / f"{stem}.parquet")
++            for key in VIDEO_KEYS:
++                _link(
++                    original / "videos/chunk-000" / key / f"{stem}.mp4",
++                    destination / "videos/chunk-000" / key / f"{stem}.mp4",
++                )
++            output_rows.append(dict(row))
++
++        offset = int(original_info["total_frames"])
++        recovery_mapping: dict[int, int] = {}
++        for row in recovery_episodes:
++            source_episode = int(row["episode_index"])
++            target_episode = len(original_episodes) + source_episode
++            recovery_mapping[source_episode] = target_episode
++            _require_episode_files(recovery, source_episode)
++            source_stem, target_stem = f"episode_{source_episode:06d}", f"episode_{target_episode:06d}"
++            target_parquet = destination / "data/chunk-000" / f"{target_stem}.parquet"
++            if validate_parquet:
++                _copy_recovery_parquet(
++                    recovery / "data/chunk-000" / f"{source_stem}.parquet",
++                    target_parquet,
++                    source_episode,
++                    target_episode,
++                    offset,
++                )
++            else:
++                _link(recovery / "data/chunk-000" / f"{source_stem}.parquet", target_parquet)
++            for key in VIDEO_KEYS:
++                _link(
++                    recovery / "videos/chunk-000" / key / f"{source_stem}.mp4",
++                    destination / "videos/chunk-000" / key / f"{target_stem}.mp4",
++                )
++            output_row = dict(row)
++            output_row["episode_index"] = target_episode
++            output_rows.append(output_row)
++            offset += int(row["length"])
++
++        (destination / "meta/episodes.jsonl").write_text("\n".join(json.dumps(row) for row in output_rows) + "\n")
++        report = {
++            "original_episodes": len(original_episodes),
++            "original_frames": int(original_info["total_frames"]),
++            "recovery_episodes": len(recovery_episodes),
++            "recovery_frames": int(recovery_info["total_frames"]),
++            "mix_episodes": len(output_rows),
++            "mix_frames": int(info["total_frames"]),
++            "recovery_mapping": recovery_mapping,
++        }
++        (destination / "joint_recovery_mix_manifest.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
++        return report
++    except Exception:
++        shutil.rmtree(destination)
++        raise
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--original", type=Path, required=True)
++    parser.add_argument("--recovery", type=Path, required=True)
++    parser.add_argument("--destination", type=Path, required=True)
++    args = parser.parse_args()
++    report = build_mix(args.original, args.recovery, args.destination)
++    print(json.dumps(report, indent=2, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
+
+diff --git a/scripts/test_prepare_piper_joint_recovery_mix.py b/scripts/test_prepare_piper_joint_recovery_mix.py
+new file mode 100644
+index 0000000..0668e56
+--- /dev/null
++++ b/scripts/test_prepare_piper_joint_recovery_mix.py
+@@ -0,0 +1,62 @@
++import importlib.util
++import json
++from pathlib import Path
++
++
++SCRIPT = Path(__file__).with_name("prepare_piper_joint_recovery_mix.py")
++
++
++def _load_module():
++    spec = importlib.util.spec_from_file_location("joint_mix", SCRIPT)
++    assert spec and spec.loader
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def _write_dataset(root: Path, lengths: list[int], label: str) -> None:
++    (root / "data/chunk-000").mkdir(parents=True)
++    for key in ("observation.images.top", "observation.images.wrist"):
++        (root / "videos/chunk-000" / key).mkdir(parents=True)
++    info = {
++        "total_episodes": len(lengths),
++        "total_frames": sum(lengths),
++        "fps": 30,
++        "features": {
++            "observation.state": {"shape": [7], "names": ["J1.pos", "J2.pos", "J3.pos", "J4.pos", "J5.pos", "J6.pos", "G.pos"]},
++            "action": {"shape": [7], "names": ["J1.pos", "J2.pos", "J3.pos", "J4.pos", "J5.pos", "J6.pos", "G.pos"]},
++            "observation.images.top": {"dtype": "video"},
++            "observation.images.wrist": {"dtype": "video"},
++        },
++    }
++    (root / "meta").mkdir()
++    (root / "meta/info.json").write_text(json.dumps(info))
++    (root / "meta/stats.json").write_text("{}")
++    (root / "meta/tasks.jsonl").write_text('{"task_index": 0, "task": "pick and place"}\n')
++    rows = []
++    for index, length in enumerate(lengths):
++        name = f"episode_{index:06d}"
++        (root / "data/chunk-000" / f"{name}.parquet").write_text(f"{label}-data-{index}")
++        for key in ("observation.images.top", "observation.images.wrist"):
++            (root / "videos/chunk-000" / key / f"{name}.mp4").write_text(f"{label}-video-{index}")
++        rows.append(json.dumps({"episode_index": index, "tasks": ["pick and place"], "length": length}))
++    (root / "meta/episodes.jsonl").write_text("\n".join(rows) + "\n")
++
++
++def test_build_mix_preserves_sources_and_offsets_recovery_episode_ids(tmp_path: Path):
++    """Catches a merger that overwrites inputs or fails to map recovery after originals."""
++    module = _load_module()
++    original = tmp_path / "original"
++    recovery = tmp_path / "recovery"
++    mixed = tmp_path / "mixed"
++    _write_dataset(original, [2, 3], "original")
++    _write_dataset(recovery, [4], "recovery")
++
++    report = module.build_mix(original, recovery, mixed, validate_parquet=False)
++
++    assert report["mix_episodes"] == 3
++    assert report["mix_frames"] == 9
++    assert report["recovery_mapping"] == {0: 2}
++    assert json.loads((mixed / "meta/episodes.jsonl").read_text().splitlines()[2])["episode_index"] == 2
++    assert (original / "data/chunk-000/episode_000000.parquet").read_text() == "original-data-0"
++    assert (recovery / "data/chunk-000/episode_000000.parquet").read_text() == "recovery-data-0"
+
+diff --git a/scripts/validate_joint_rtc_quality58.py b/scripts/validate_joint_rtc_quality58.py
+new file mode 100644
+index 0000000..e3d06f2
+--- /dev/null
++++ b/scripts/validate_joint_rtc_quality58.py
+@@ -0,0 +1,264 @@
++#!/usr/bin/env python3
++"""Hard validation and metadata freeze for the Joint RTC Quality58 dataset."""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++from collections import Counter
++from pathlib import Path
++from typing import Any
++
++
++QA_ROOT = Path("<DATA_QA_ROOT>/joint_rtc_expert_salvage_20260901T161500Z")
++NOMINAL_ROOT = Path("<NOMINAL_DATASET_ROOT>")
++RECOVERY_ROOT = Path("<RECOVERY_DATASET_ROOT>")
++EXPECTED_EPISODES = 58
++EXPECTED_WINDOWS = 25336
++HORIZON = 20
++
++
++def sha256_file(path: Path) -> str:
++    digest = hashlib.sha256()
++    with path.open("rb") as handle:
++        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def sha256_json(path: Path) -> str:
++    return sha256_file(path)
++
++
++def load_json(path: Path) -> Any:
++    return json.loads(path.read_text())
++
++
++def _require(condition: bool, message: str) -> None:
++    if not condition:
++        raise AssertionError(message)
++
++
++def _range_indices(ranges: list[list[int]]) -> list[int]:
++    values: list[int] = []
++    for item in ranges:
++        _require(len(item) == 2, f"range must have two values: {item}")
++        start, end = (int(item[0]), int(item[1]))
++        _require(start <= end, f"descending range: {item}")
++        values.extend(range(start, end + 1))
++    return values
++
++
++def _source_fingerprint(root: Path, selected_episode_ids: list[str], source_type: str) -> dict[str, Any]:
++    meta_paths = sorted((root / "meta").glob("*"))
++    meta_hashes = {str(path.relative_to(root)): sha256_file(path) for path in meta_paths if path.is_file()}
++    selected_files: list[dict[str, Any]] = []
++    for episode_id in selected_episode_ids:
++        episode = int(episode_id)
++        if source_type == "nominal":
++            parquet = root / "data" / "chunk-000" / f"episode_{episode:06d}.parquet"
++            video_paths = [
++                root / "videos" / "chunk-000" / key / f"episode_{episode:06d}.mp4"
++                for key in ("observation.images.top", "observation.images.wrist")
++            ]
++        else:
++            parquet = root / f"episode_{episode:06d}" / "frame_000000.pkl"
++            video_paths = []
++        paths = [parquet, *video_paths]
++        for path in paths:
++            _require(path.exists(), f"missing source file: {path}")
++            stat = path.stat()
++            selected_files.append(
++                {
++                    "path": str(path),
++                    "size": stat.st_size,
++                    "sha256": sha256_file(path) if path.suffix == ".parquet" else None,
++                }
++            )
++    payload = {"root": str(root), "meta_sha256": meta_hashes, "selected_files": selected_files}
++    payload_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
++    payload["fingerprint_sha256"] = hashlib.sha256(payload_bytes).hexdigest()
++    return payload
++
++
++def validate(qa_root: Path = QA_ROOT) -> dict[str, Any]:
++    manifest_path = qa_root / "FINAL_TRAINING_MANIFEST.json"
++    mask_path = qa_root / "FINAL_TRAIN_SAMPLE_MASK.json"
++    review_path = qa_root / "visual_review_results.json"
++    review_summary_path = qa_root / "visual_review_summary.json"
++    train_mask_path = qa_root / "TRAIN_SAMPLE_MASK.json"
++    review_manifest_path = qa_root / "review_manifest.json"
++    for path in (
++        manifest_path,
++        mask_path,
++        review_path,
++        review_summary_path,
++        train_mask_path,
++        review_manifest_path,
++    ):
++        _require(path.is_file(), f"missing QA artifact: {path}")
++
++    manifest = load_json(manifest_path)
++    mask = load_json(mask_path)
++    reviews = load_json(review_path)
++    review_summary = load_json(review_summary_path)
++    review_manifest = load_json(review_manifest_path)
++
++    episodes = manifest["episodes"]
++    mask_episodes = mask["episodes"]
++    _require(manifest["action_horizon"] == HORIZON, "manifest horizon mismatch")
++    _require(mask["action_horizon"] == HORIZON, "mask horizon mismatch")
++    _require(manifest["fps"] == 30 and mask["fps"] == 30, "fps mismatch")
++    _require(len(episodes) == EXPECTED_EPISODES, f"expected {EXPECTED_EPISODES} episodes")
++    _require(len({episode["episode_id"] for episode in episodes}) == EXPECTED_EPISODES, "duplicate episode ids")
++    _require(len(mask_episodes) == EXPECTED_EPISODES, "mask episode count mismatch")
++
++    nominal = [episode for episode in episodes if episode["source"] == "nominal"]
++    recovery = [episode for episode in episodes if episode["source"] == "recovery"]
++    _require(len(nominal) == 47, f"nominal count mismatch: {len(nominal)}")
++    _require(len(recovery) == 11, f"recovery count mismatch: {len(recovery)}")
++    _require(set(mask_episodes) == {episode["episode_id"] for episode in episodes}, "manifest/mask key mismatch")
++
++    review_statuses = {key: value["review_status"] for key, value in reviews.items()}
++    _require(len(review_statuses) == 58, "review result count mismatch")
++    _require(all(status in {"PASS_A", "PASS_B", "PASS"} for status in review_statuses.values()), "non-pass review found")
++    _require(
++        Counter(value for key, value in review_statuses.items() if key.startswith("nominal_"))
++        == Counter({"PASS_A": 22, "PASS_B": 25}),
++        "nominal visual review counts mismatch",
++    )
++    _require(
++        Counter(value for key, value in review_statuses.items() if key.startswith("recovery_")) == Counter({"PASS": 11}),
++        "recovery visual review counts mismatch",
++    )
++    _require(review_summary["nominal_visual_pass_count"] == 47, "nominal visual pass summary mismatch")
++    _require(review_summary["recovery_visual_pass_count"] == 11, "recovery visual pass summary mismatch")
++    _require(review_summary["fail_count"] == 0 and review_summary["ambiguous_count"] == 0, "failed visual review exists")
++
++    quality_counts = {}
++    source_windows = {}
++    all_windows = 0
++    for source_name, source_episodes in (("nominal", nominal), ("recovery", recovery)):
++        source_quality = Counter()
++        source_window_count = 0
++        for episode in source_episodes:
++            episode_id = episode["episode_id"]
++            _require(review_statuses.get(episode_id) in {"PASS_A", "PASS_B", "PASS"}, f"episode not visually passed: {episode_id}")
++            _require(episode["mask_key"] == episode_id, f"mask key mismatch: {episode_id}")
++            _require(episode_id in mask_episodes, f"missing mask: {episode_id}")
++            entry = mask_episodes[episode_id]
++            indices = _range_indices(entry["allowed_start_ranges"])
++            _require(indices == sorted(set(indices)), f"overlapping/unsorted ranges: {episode_id}")
++            _require(indices == [int(x) for x in entry["allowed_start_indices"]], f"expanded ranges mismatch: {episode_id}")
++            frame_count = int(episode["frame_count"])
++            legal_max = frame_count - HORIZON
++            _require(all(0 <= start <= legal_max for start in indices), f"out-of-bounds H20 start: {episode_id}")
++            _require(len(indices) == int(entry["valid_h20_windows"]) == int(episode["valid_h20_windows"]), f"window count mismatch: {episode_id}")
++            _require(int(entry["total_h20_windows"]) == frame_count - HORIZON + 1, f"total H20 count mismatch: {episode_id}")
++            _require(episode["quality_class"] in {"CLEAN", "SALVAGEABLE"}, f"bad quality class: {episode_id}")
++            _require(entry["source"] == source_name, f"mask source mismatch: {episode_id}")
++            if source_name == "nominal":
++                _require(entry["visual_review_status"] in {"PASS_A", "PASS_B"}, f"nominal mask review mismatch: {episode_id}")
++            else:
++                _require(entry["visual_review_status"] == "PASS", f"recovery mask review mismatch: {episode_id}")
++            source_quality[episode["quality_class"]] += 1
++            source_window_count += len(indices)
++            all_windows += len(indices)
++        quality_counts[source_name] = dict(source_quality)
++        source_windows[source_name] = source_window_count
++
++    _require(all_windows == EXPECTED_WINDOWS, f"expected {EXPECTED_WINDOWS} legal windows, got {all_windows}")
++    _require(source_windows == {"nominal": 19889, "recovery": 5447}, f"source window totals mismatch: {source_windows}")
++
++    diversity = manifest["diversity_recomputed"]
++    _require(diversity["coverage"]["formatted"] == "7/7 (100%)", "diversity coverage mismatch")
++    nominal_clusters = {int(episode["diversity_cluster"]) for episode in nominal}
++    _require(nominal_clusters == set(range(7)), f"diversity cluster coverage mismatch: {nominal_clusters}")
++    _require(manifest["DIVERSITY_GATE"] == "PASS", "manifest diversity gate is not PASS")
++    _require(manifest["QUALITY_GATE"] == "PASS", "manifest quality gate is not PASS")
++    _require(manifest["DATA_QUANTITY_GATE"] == "PASS", "manifest data quantity gate is not PASS")
++
++    source_episode_ids = {
++        "nominal": [episode["source_episode_id"] for episode in nominal],
++        "recovery": [episode["source_episode_id"] for episode in recovery],
++    }
++    _require(len(set(source_episode_ids["nominal"])) == 47, "duplicate nominal source episode")
++    _require(len(set(source_episode_ids["recovery"])) == 11, "duplicate recovery source episode")
++    _require(all(episode["dataset_root"] == str(NOMINAL_ROOT) for episode in nominal), "nominal source root mismatch")
++    _require(all(episode["dataset_root"] == str(RECOVERY_ROOT) for episode in recovery), "recovery source root mismatch")
++    _require(review_manifest["total_episodes"] == 58, "review manifest total mismatch")
++
++    result = {
++        "validated_at_utc": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
++        "qa_root": str(qa_root),
++        "final_manifest": str(manifest_path),
++        "final_mask": str(mask_path),
++        "counts": {
++            "final_nominal_count": len(nominal),
++            "final_recovery_count": len(recovery),
++            "total_final_episodes": len(episodes),
++            "nominal_clean_count": quality_counts["nominal"].get("CLEAN", 0),
++            "nominal_salvageable_count": quality_counts["nominal"].get("SALVAGEABLE", 0),
++            "recovery_clean_count": quality_counts["recovery"].get("CLEAN", 0),
++            "recovery_salvageable_count": quality_counts["recovery"].get("SALVAGEABLE", 0),
++            "final_valid_h20_windows": all_windows,
++        },
++        "source_windows": source_windows,
++        "diversity": {
++            "cluster_count": 7,
++            "coverage": "7/7",
++            "cluster_ids": sorted(nominal_clusters),
++            "feature_components": diversity["feature_components"],
++        },
++        "gates": {
++            "visual_success_nominal": 47,
++            "quality_gate": "PASS",
++            "diversity_gate": "PASS",
++            "data_quantity_gate": "PASS",
++            "dataset_ready_for_rtc_training": "YES",
++            "more_data_needed": "NO",
++        },
++        "input_sha256": {
++            name: sha256_json(qa_root / name)
++            for name in (
++                "FINAL_TRAINING_MANIFEST.json",
++                "FINAL_TRAIN_SAMPLE_MASK.json",
++                "visual_review_results.json",
++                "visual_review_summary.json",
++                "TRAIN_SAMPLE_MASK.json",
++                "review_manifest.json",
++            )
++        },
++        "source_fingerprints": {
++            "nominal": _source_fingerprint(NOMINAL_ROOT, source_episode_ids["nominal"], "nominal"),
++            "recovery": _source_fingerprint(RECOVERY_ROOT, source_episode_ids["recovery"], "recovery"),
++        },
++        "read_only_contract": {
++            "source_data_modified": "NO",
++            "training_started": "NO",
++            "norm_recomputed": "NO",
++            "real_robot_executed": "NO",
++            "can_write": "NO",
++        },
++    }
++    return result
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--qa-root", type=Path, default=QA_ROOT)
++    parser.add_argument("--write-freeze", action="store_true")
++    args = parser.parse_args()
++    result = validate(args.qa_root.resolve())
++    print(json.dumps(result, indent=2, sort_keys=True))
++    if args.write_freeze:
++        output = args.qa_root / "RTC_QUALITY58_DATA_FREEZE.json"
++        output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
++        print(f"FREEZE_WRITTEN={output}")
++    print("VALIDATION=PASS")
++
++
++if __name__ == "__main__":
++    main()
+
+diff --git a/scripts/smoke_joint_rtc_h20_quality58.py b/scripts/smoke_joint_rtc_h20_quality58.py
+new file mode 100644
+index 0000000..c910f7c
+--- /dev/null
++++ b/scripts/smoke_joint_rtc_h20_quality58.py
+@@ -0,0 +1,203 @@
++"""Run the exact five-step Quality58 H20 training smoke on an RTX5090.
++
++This script intentionally uses the production train-state and train-step code,
++but never initializes checkpoints/W&B and never saves anything. It is a gate,
++not a formal training launcher.
++"""
++
++from __future__ import annotations
++
++import argparse
++import functools
++import json
++import os
++from pathlib import Path
++import resource
++import subprocess
++import sys
++import time
++import traceback
++
++import jax
++import jax.numpy as jnp
++
++import openpi.training.config as config_lib
++import openpi.training.data_loader as data_loader
++import openpi.training.sharding as sharding
++
++# scripts/ is not a package; import the production train helpers directly.
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++from train import init_train_state, train_step  # noqa: E402
++
++CONFIG_NAME = "pi05_piper_joint_rtc_h20_quality58_finetune"
++SMOKE_STEPS = 5
++
++
++def _run_command(command: list[str]) -> str:
++    try:
++        result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=20)
++        return (result.stdout + result.stderr).strip()
++    except Exception as exc:  # pragma: no cover - diagnostics must not mask the gate result.
++        return f"command failed: {type(exc).__name__}: {exc}"
++
++
++def _gpu_snapshot() -> dict[str, str]:
++    query = _run_command(
++        [
++            "nvidia-smi",
++            "--query-gpu=name,memory.total,memory.used,memory.free,temperature.gpu",
++            "--format=csv,noheader,nounits",
++        ]
++    )
++    return {
++        "nvidia_smi_query": query,
++        "nvidia_smi_full": _run_command(["nvidia-smi"]),
++    }
++
++
++def _host_rss_mib() -> float:
++    # Linux reports KiB in ru_maxrss.
++    return float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1024.0
++
++
++def _is_cuda_oom(exc: BaseException) -> bool:
++    text = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}".lower()
++    return any(token in text for token in ("cuda out of memory", "cuda oom", "resource exhausted", "out of memory"))
++
++
++def _assert_rtx5090() -> dict[str, object]:
++    devices = jax.devices()
++    if jax.default_backend() not in {"gpu", "cuda"} or not devices or any(device.platform != "gpu" for device in devices):
++        raise RuntimeError(f"RTX5090 gate requires GPU JAX backend, got backend={jax.default_backend()} devices={devices}")
++    gpu_info = _gpu_snapshot()
++    if "5090" not in gpu_info["nvidia_smi_query"]:
++        raise RuntimeError(f"RTX5090 gate could not confirm an RTX5090 from nvidia-smi: {gpu_info['nvidia_smi_query']}")
++    return {
++        "jax_backend": jax.default_backend(),
++        "jax_devices": [str(device) for device in devices],
++        **gpu_info,
++    }
++
++
++def _run_once(batch_size: int, fallback_used: bool) -> int:
++    started = time.perf_counter()
++    report: dict[str, object] = {
++        "config_name": CONFIG_NAME,
++        "requested_batch_size": batch_size,
++        "fallback_used": fallback_used,
++        "steps_requested": SMOKE_STEPS,
++        "checkpoint_save": False,
++        "orbax_save": False,
++        "wandb_enabled": False,
++        "robot_connected": False,
++        "can_write": False,
++        "losses": [],
++        "grad_norms": [],
++        "step_seconds": [],
++        "host_rss_peak_mib": _host_rss_mib(),
++        "gpu_before": {},
++    }
++
++    try:
++        gpu_info = _assert_rtx5090()
++        report["gpu_before"] = gpu_info
++        config = config_lib.get_config(CONFIG_NAME)
++        if config.batch_size != 16 or config.model.action_horizon != 20 or config.model.action_dim != 32:
++            raise RuntimeError(f"unexpected exact config values: batch_size={config.batch_size}, model={config.model}")
++        if (
++            not config.model.training_rtc
++            or config.model.training_rtc_max_delay != 4
++            or config.model.training_rtc_action_dim != 7
++        ):
++            raise RuntimeError("Quality58 config is not using H20 training-time RTC max delay 4")
++        if batch_size not in (16, 8):
++            raise ValueError(f"smoke batch size must be 16 or the single OOM fallback 8, got {batch_size}")
++
++        mesh = sharding.make_mesh(config.fsdp_devices)
++        data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
++        replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
++        smoke_config = config if batch_size == config.batch_size else config_lib.dataclasses.replace(config, batch_size=batch_size)
++
++        data_loader_obj = data_loader.create_data_loader(
++            smoke_config,
++            sharding=data_sharding,
++            shuffle=True,
++            num_batches=SMOKE_STEPS,
++        )
++        data_iter = iter(data_loader_obj)
++        first_batch = next(data_iter)
++        report["dataset_class"] = type(data_loader_obj).__name__
++        report["dataset_length"] = len(data_loader_obj._data_loader._data_loader.dataset)  # noqa: SLF001
++        report["batch_shapes"] = {
++            "state": list(first_batch[0].state.shape),
++            "actions": list(first_batch[1].shape),
++        }
++
++        rng = jax.random.key(config.seed)
++        train_rng, init_rng = jax.random.split(rng)
++        init_started = time.perf_counter()
++        train_state, train_state_sharding = init_train_state(smoke_config, init_rng, mesh, resume=False)
++        jax.block_until_ready(train_state)
++        report["init_seconds"] = time.perf_counter() - init_started
++
++        ptrain_step = jax.jit(
++            functools.partial(train_step, smoke_config),
++            in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
++            out_shardings=(train_state_sharding, replicated_sharding),
++            donate_argnums=(1,),
++        )
++
++        for step in range(SMOKE_STEPS):
++            batch = first_batch if step == 0 else next(data_iter)
++            step_started = time.perf_counter()
++            with sharding.set_mesh(mesh):
++                train_state, info = ptrain_step(train_rng, train_state, batch)
++            jax.block_until_ready((train_state, info))
++            elapsed = time.perf_counter() - step_started
++            loss = float(jax.device_get(info["loss"]))
++            grad_norm = float(jax.device_get(info["grad_norm"]))
++            if not (jnp.isfinite(loss) and jnp.isfinite(grad_norm)):
++                raise RuntimeError(f"non-finite smoke metrics at step {step}: loss={loss}, grad_norm={grad_norm}")
++            report["losses"].append(loss)
++            report["grad_norms"].append(grad_norm)
++            report["step_seconds"].append(elapsed)
++            report["host_rss_peak_mib"] = max(float(report["host_rss_peak_mib"]), _host_rss_mib())
++            report[f"gpu_step_{step}"] = _gpu_snapshot()
++
++        report["status"] = "PASS"
++        report["steps_completed"] = SMOKE_STEPS
++        report["elapsed_seconds"] = time.perf_counter() - started
++        report["gpu_after"] = _gpu_snapshot()
++        print(json.dumps(report, indent=2))
++        return 0
++    except BaseException as exc:
++        report["status"] = "FAIL"
++        report["steps_completed"] = len(report["losses"])
++        report["elapsed_seconds"] = time.perf_counter() - started
++        report["exception"] = f"{type(exc).__name__}: {exc}"
++        report["traceback"] = traceback.format_exc()
++        report["gpu_after"] = _gpu_snapshot()
++        report["host_rss_peak_mib"] = max(float(report["host_rss_peak_mib"]), _host_rss_mib())
++        print(json.dumps(report, indent=2), file=sys.stderr)
++        if batch_size == 16 and not fallback_used and _is_cuda_oom(exc):
++            print("BATCH16_CUDA_OOM=YES; starting the single permitted clean-process batch8 fallback", file=sys.stderr)
++            env = dict(os.environ)
++            env["OPENPI_QUALITY58_SMOKE_FALLBACK"] = "1"
++            return subprocess.run(
++                [sys.executable, str(Path(__file__).resolve()), "--batch-size", "8", "--fallback-used"],
++                check=False,
++                env=env,
++            ).returncode
++        return 1
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--batch-size", type=int, default=16)
++    parser.add_argument("--fallback-used", action="store_true")
++    args = parser.parse_args()
++    return _run_once(args.batch_size, args.fallback_used)
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

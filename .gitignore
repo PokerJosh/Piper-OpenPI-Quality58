@@ -1,0 +1,44 @@
+# Secrets and local credentials
+.env
+.env.*
+*.pem
+*.key
+*.token
+credentials*
+secrets*
+
+# Runtime/data/model outputs (never archive)
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+assets/
+checkpoints/
+data/
+wandb/
+artifacts/*checkpoint*
+artifacts/*dataset*
+artifacts/*video*
+artifacts/*log*
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.npy
+*.npz
+*.parquet
+*.pkl
+*.pickle
+*.jsonl
+*.log
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/

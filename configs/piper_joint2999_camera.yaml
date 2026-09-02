@@ -1,0 +1,13 @@
+top:
+  kind: opencv
+  path: <TOP_CAMERA_DEVICE_PATH>
+  fourcc: MJPG
+  width: 640
+  height: 480
+  fps: 30
+wrist:
+  kind: intelrealsense
+  serial: "<REDACTED>"
+  width: 640
+  height: 480
+  fps: 30

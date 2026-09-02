@@ -1,0 +1,6 @@
+MAIN_HEAD=c4c3b57277862c90a54173562e582f3cf1d4c2c0
+DEPLOYMENT_HEAD=18cf73215927e95b960e98562cebdc8040c2effe
+UPSTREAM_OPENPI_ORIGIN_MAIN=15a9616a00943ada6c20a0f158e3adb39df2ccac
+MAIN_BRANCH=main
+DEPLOYMENT_BRANCH=codex/direct-joint2999
+NOTE=Files under src/openpi/rollouts and scripts/pi05_joint2999_rollout.py come from the deployment worktree; shared training files at the archive root come from the main worktree.

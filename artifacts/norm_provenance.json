@@ -1,0 +1,17 @@
+{
+  "config_name": "pi05_piper_joint_rtc_h20_quality58_finetune",
+  "manifest_path": "<DATA_QA_ROOT>/joint_rtc_expert_salvage_20260901T161500Z/FINAL_TRAINING_MANIFEST.json",
+  "mask_path": "<DATA_QA_ROOT>/joint_rtc_expert_salvage_20260901T161500Z/FINAL_TRAIN_SAMPLE_MASK.json",
+  "dataset_class": "MaskAwareJointRTCDataset",
+  "action_horizon": 20,
+  "action_dim": 7,
+  "windows_seen": 25336,
+  "batch_size": 16,
+  "batches_seen": 1584,
+  "drop_last": false,
+  "transforms": [
+    "RepackTransform",
+    "PiperInputs",
+    "DeltaActions"
+  ]
+}

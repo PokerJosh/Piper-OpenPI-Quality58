@@ -1,0 +1,1628 @@
+"""Guarded Direct Joint2999 rollout with a read-only dry-run default."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from dataclasses import replace
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import socket
+import struct
+import sys
+import threading
+import time
+from typing import Any
+
+import numpy as np
+
+
+PROJECT_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(PROJECT_SRC) not in sys.path:
+    sys.path.insert(0, str(PROJECT_SRC))
+
+from openpi.rollouts.direct_joint_core import LatestOnlyTargetMailbox
+from openpi.rollouts.direct_joint_core import PhaseAwareExecutor
+from openpi.rollouts.direct_joint_core import Target
+from openpi.rollouts.direct_joint_core import gripper_send_decision
+from openpi.rollouts.direct_joint_core import validate_executor_command
+from openpi.rollouts.direct_joint_core import validate_raw_target
+
+
+CONTROL_HZ = 50.0
+CONTROL_DT = 1.0 / CONTROL_HZ
+STALE_AFTER_SECONDS = 0.50
+FIRST_TARGET_TIMEOUT_SECONDS = 20.0
+DRIVER_SPEED_CAP_DEG_S = 50.0
+CONFIG_NAME = "pi05_piper_joint_rtc_h20_quality58_finetune"
+CHECKPOINT = Path(
+    "<CHECKPOINT_ROOT>/pi05_piper_joint_rtc_h20_quality58_finetune/"
+    "pi05_piper_joint_rtc_h20_quality58_3k_20260902_135854/2999"
+)
+PROMPT = "pick up the battery and place it into the target location"
+MANIFEST = Path("configs/piper_joint2999_camera.yaml")
+CAN_INTERFACE = "can0"
+REAL_ACKNOWLEDGEMENT = "I_UNDERSTAND_JOINT2999_REAL_RUN"
+SOCKETCAN_WRITE_ADAPTER = "socketcan-absolute-joint"
+
+_CAN_FRAME = struct.Struct("=IB3x8s")
+_ARM_STATUS_ID = 0x2A1
+_JOINT_FEEDBACK_IDS = (0x2A5, 0x2A6, 0x2A7)
+_GRIPPER_FEEDBACK_ID = 0x2A8
+_DRIVER_STATUS_IDS = tuple(range(0x261, 0x267))
+_DRIVER_FAULT_MASK = 0xBF
+_GRIPPER_FAULT_MASK = 0x3F
+
+
+class PreflightError(RuntimeError):
+    """A failed read-only preflight with its concrete report attached."""
+
+    def __init__(self, message: str, report: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.report = report
+
+
+def build_joint_observation(top_rgb, wrist_rgb, joint_deg_6, gripper_m, prompt) -> dict:
+    """Build Piper's native six-joint-plus-gripper observation."""
+    top = _camera_to_channel_first(top_rgb, "top")
+    wrist = _camera_to_channel_first(wrist_rgb, "wrist")
+    joints = _finite_vector(joint_deg_6, 6, "joint_deg_6")
+    gripper = float(gripper_m)
+    if not math.isfinite(gripper):
+        raise ValueError("gripper_m must be finite")
+    return {
+        "images": {"top": top, "wrist": wrist},
+        "state": np.concatenate((joints, np.array([gripper], dtype=np.float32))).astype(np.float32),
+        "prompt": str(prompt),
+    }
+
+
+def load_joint_policy(checkpoint_dir, config_name, prompt) -> tuple[Any, dict[str, Any]]:
+    """Load the fixed joint policy and expose its immutable deployment metadata."""
+    from openpi.policies import policy_config
+    from openpi.training import config as training_config
+
+    config = training_config.get_config(config_name)
+    if config_name not in {
+        "pi05_piper_joint_rtc_h20_quality58_finetune",
+    } and config.data.__class__.__name__ != "LeRobotPiperDataConfig":
+        raise ValueError("selected config is not the Piper joint configuration")
+    checkpoint = Path(checkpoint_dir)
+    norm_path = checkpoint / "assets" / str(config.data.assets.asset_id)
+    policy = policy_config.create_trained_policy(config, checkpoint, default_prompt=prompt)
+    metadata = {
+        "JOINT_CONFIG": config_name,
+        "JOINT_CHECKPOINT": str(checkpoint),
+        "ACTION_HORIZON": int(config.model.action_horizon),
+        "MODEL_ACTION_DIM": int(config.model.action_dim),
+        "ACTION_DIM": 7,
+        "NORM_PATH": str(norm_path),
+        "NORM_SHA256": _hash_path(norm_path),
+        "PROMPT": str(prompt),
+        "OUTPUT_SEMANTICS": "ABSOLUTE_JOINT_DEG_J1_J6_PLUS_ABSOLUTE_GRIPPER",
+        "CHECKPOINT_LOAD": "PASS",
+    }
+    return policy, metadata
+
+
+def run_preflight(args, dependencies=None) -> dict[str, Any]:
+    """Probe cameras, feedback, and driver health without enabling motion."""
+    from scripts.verify_piper_joint2999_cameras import load_camera_manifest
+    from scripts.verify_piper_joint2999_cameras import verify_manifest_shape
+
+    manifest_path = Path(getattr(args, "manifest", MANIFEST))
+    report: dict[str, Any] = {
+        "OPERATOR_ONSITE": os.environ.get("OPERATOR_ONSITE", "NO"),
+        "ESTOP_READY": os.environ.get("ESTOP_READY", "NO"),
+        "WORKSPACE_CLEAR": os.environ.get("WORKSPACE_CLEAR", "NO"),
+        "JOINT_CONFIG": getattr(args, "config_name", CONFIG_NAME),
+        "JOINT_CHECKPOINT": str(getattr(args, "checkpoint", CHECKPOINT)),
+        "PROMPT": str(getattr(args, "prompt", PROMPT)),
+        "MANIFEST": str(manifest_path),
+        "PIPER_CAN_MODE": "READ_ONLY",
+        "PIPER_CONNECTION": "NOT_OPENED",
+        "CAN_INTERFACE": str(getattr(args, "can_interface", CAN_INTERFACE)),
+        "CAN_INTERFACE_CONFIGURATION": "UNCHANGED",
+        "ARM_STATUS": "NOT_ENABLED",
+        "DRIVER_FAULT": "NOT_QUERIED",
+        "GPU_JAX": "NOT_CHECKED",
+        "CHECKPOINT_LOAD": "NOT_STARTED",
+        "OUTPUT_SEMANTICS": "ABSOLUTE_JOINT_DEG_J1_J6_PLUS_ABSOLUTE_GRIPPER",
+        "ARM_ENABLE_COUNT": 0,
+        "COMMAND_SEND_COUNT": 0,
+        "REAL_CAN_WRITE": "NO",
+        "REAL_ROBOT_EXECUTED": "NO",
+    }
+    failures: list[str] = []
+    owned_dependencies = False
+    if dependencies is None:
+        dependencies = DefaultRuntimeDependencies(
+            policy=None,
+            manifest_path=manifest_path,
+            can_interface=str(getattr(args, "can_interface", CAN_INTERFACE)),
+        )
+        owned_dependencies = True
+
+    try:
+        manifest = load_camera_manifest(manifest_path)
+        verify_manifest_shape(manifest)
+        report["CAMERA_MANIFEST"] = "PASS"
+
+        try:
+            camera_report = dependencies.probe_cameras(manifest)
+            _validate_camera_probe_report(camera_report, manifest)
+            report.update(
+                {
+                    "CAMERA_PROBE": "PASS",
+                    "CAMERA_TOP": camera_report["top"],
+                    "CAMERA_WRIST": camera_report["wrist"],
+                }
+            )
+        except Exception as error:
+            report.update({"CAMERA_PROBE": "FAIL", "CAMERA_ERROR": str(error)})
+            failures.append(f"CAMERA_PROBE={error}")
+
+        try:
+            feedback_report = dependencies.probe_feedback()
+            feedback = _finite_vector(feedback_report["feedback"], 7, "preflight feedback")
+            feedback_timestamp = float(feedback_report["feedback_timestamp"])
+            feedback_age = _age(_clock(dependencies), feedback_timestamp)
+            driver_status = feedback_report["driver_status"]
+            report.update(
+                {
+                    "FEEDBACK_PROBE": "PASS",
+                    "PIPER_CONNECTION": "READ_ONLY_PASS",
+                    "FEEDBACK": feedback,
+                    "FEEDBACK_TIMESTAMP": feedback_timestamp,
+                    "FEEDBACK_AGE_SECONDS": feedback_age,
+                    "DRIVER_STATUS": driver_status,
+                    "DRIVER_FAULT": "NO" if driver_status.get("healthy") is True else "YES",
+                }
+            )
+            if _stale_reason(feedback_age) is not None:
+                failures.append("FEEDBACK_STALE")
+            driver_reason = _driver_abort_reason(driver_status, _clock(dependencies))
+            if driver_reason is not None:
+                failures.append(driver_reason)
+        except Exception as error:
+            report.update(
+                {
+                    "FEEDBACK_PROBE": "FAIL",
+                    "PIPER_CONNECTION": "READ_ONLY_FAIL",
+                    "FEEDBACK_ERROR": str(error),
+                    "DRIVER_FAULT": "UNKNOWN",
+                }
+            )
+            failures.append(f"FEEDBACK_PROBE={error}")
+
+        missing = [key for key in ("OPERATOR_ONSITE", "ESTOP_READY", "WORKSPACE_CLEAR") if report[key] != "YES"]
+        failures.extend(f"{key}=YES" for key in missing)
+        if failures:
+            report["PREFLIGHT"] = "FAIL"
+            raise PreflightError("preflight failed: " + ", ".join(failures), report)
+        report["PREFLIGHT"] = "PASS"
+        return report
+    finally:
+        if owned_dependencies:
+            _close_if_present(dependencies)
+
+
+def run_dry_run(args, dependencies) -> dict[str, Any]:
+    """Execute the bounded read-only target and executor path."""
+    return _run(args, dependencies, real=False, write_adapter=None)
+
+
+def run_real(
+    args,
+    dependencies,
+    *,
+    write_adapter=None,
+    write_adapter_factory=None,
+    preflight_report=None,
+) -> dict[str, Any]:
+    """Execute only after exact acknowledgement, preflight, and writer selection."""
+    if getattr(args, "operator_ack", None) != REAL_ACKNOWLEDGEMENT:
+        raise RuntimeError(f"real mode requires --operator-ack {REAL_ACKNOWLEDGEMENT}")
+    duration = float(getattr(args, "max_time", 0.0))
+    if not math.isfinite(duration) or duration <= 0.0 or duration > 60.0:
+        raise ValueError("real mode maximum duration is 60 seconds")
+    if write_adapter is not None and write_adapter_factory is not None:
+        raise ValueError("real mode accepts either a write adapter or a writer factory, not both")
+    if write_adapter_factory is None:
+        _require_explicit_write_adapter(write_adapter, check_ready=False)
+    elif not callable(write_adapter_factory):
+        raise RuntimeError("real mode requires a callable write adapter factory")
+
+    # A caller-supplied report is intentionally never authoritative for a real run.
+    del preflight_report
+    fresh_preflight = run_preflight(args, dependencies=dependencies)
+    owned_write_adapter = write_adapter_factory is not None
+    if owned_write_adapter:
+        write_adapter = write_adapter_factory()
+    try:
+        _require_explicit_write_adapter(write_adapter, check_ready=False)
+        _require_explicit_write_adapter(write_adapter, check_ready=True)
+        runtime_report = _run(args, dependencies, real=True, write_adapter=write_adapter)
+        report = dict(fresh_preflight)
+        report.update(runtime_report)
+        return report
+    finally:
+        if owned_write_adapter:
+            _close_if_present(write_adapter)
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument("--real", action="store_true")
+    parser.add_argument("--manifest", type=Path, default=MANIFEST)
+    parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT)
+    parser.add_argument("--prompt", default=PROMPT)
+    parser.add_argument("--max-time", type=_positive_duration, default=60.0)
+    parser.add_argument("--output-dir", type=Path, default=Path("artifacts/direct_joint2999"))
+    parser.add_argument("--can-interface", default=CAN_INTERFACE)
+    parser.add_argument("--operator-ack")
+    parser.add_argument("--write-adapter", choices=(SOCKETCAN_WRITE_ADAPTER,))
+    args = parser.parse_args(argv)
+    args.config_name = CONFIG_NAME
+    if args.real and args.operator_ack != REAL_ACKNOWLEDGEMENT:
+        raise SystemExit(f"--real requires --operator-ack {REAL_ACKNOWLEDGEMENT}")
+    if args.real and args.write_adapter != SOCKETCAN_WRITE_ADAPTER:
+        raise SystemExit(f"--real requires --write-adapter {SOCKETCAN_WRITE_ADAPTER}")
+    if args.dry_run and args.write_adapter is not None:
+        raise SystemExit("--dry-run does not accept a write adapter")
+    return args
+
+
+def main(argv=None) -> int:
+    dependencies = None
+    report = None
+    try:
+        args = parse_args(argv)
+        policy, policy_metadata = load_joint_policy(args.checkpoint, args.config_name, args.prompt)
+        dependencies = DefaultRuntimeDependencies(
+            policy=policy,
+            manifest_path=args.manifest,
+            can_interface=args.can_interface,
+        )
+        if args.real:
+            report = run_real(
+                args,
+                dependencies,
+                write_adapter_factory=lambda: _build_explicit_write_adapter(args),
+            )
+        else:
+            preflight = run_preflight(args, dependencies=dependencies)
+            runtime_report = run_dry_run(args, dependencies)
+            report = dict(preflight)
+            report.update(runtime_report)
+        combined_report = dict(report)
+        combined_report.update(policy_metadata)
+        print(json.dumps(_json_value(combined_report), sort_keys=True))
+        return 1 if report.get("RUN_STATUS") == "FAIL" else 0
+    except PreflightError as error:
+        payload = dict(error.report)
+        payload["STOP_REASON"] = str(error)
+        print(json.dumps(_json_value(payload), sort_keys=True))
+        return 1
+    except Exception as error:
+        print(json.dumps({"STOP_REASON": str(error), "REAL_CAN_WRITE": "NO", "REAL_ROBOT_EXECUTED": "NO"}))
+        return 1
+    finally:
+        worker_still_alive = (
+            report is not None
+            and report.get("CAMERA_INFERENCE_WORKER_STOPPED") == "NO"
+        )
+        if not worker_still_alive:
+            _close_if_present(dependencies)
+
+
+class DefaultRuntimeDependencies:
+    """Declared cameras, policy, and a direct read-only SocketCAN feedback reader."""
+
+    def __init__(self, *, policy, manifest_path: Path, can_interface: str) -> None:
+        from scripts.verify_piper_joint2999_cameras import load_camera_manifest
+        from scripts.verify_piper_joint2999_cameras import verify_manifest_shape
+
+        self._policy = policy
+        self._manifest = load_camera_manifest(manifest_path)
+        verify_manifest_shape(self._manifest)
+        self._feedback_reader = ReadOnlyPiperCanFeedback(can_interface)
+        self._camera_reader = None
+        self.command_sink = _PreviewOnlySink()
+
+    def monotonic(self) -> float:
+        return time.monotonic()
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+    def probe_cameras(self, manifest):
+        from scripts.verify_piper_joint2999_cameras import probe_cameras
+
+        return probe_cameras(manifest, read_frames=True)
+
+    def probe_feedback(self) -> dict[str, Any]:
+        return self._feedback_reader.probe()
+
+    def read_camera_pair(self):
+        if self._camera_reader is None:
+            self._camera_reader = ManifestCameraPairReader(self._manifest)
+        return self._camera_reader.read()
+
+    def read_feedback(self):
+        return self._feedback_reader.read_feedback()
+
+    def driver_status(self) -> dict[str, Any]:
+        return self._feedback_reader.driver_status()
+
+    def infer(self, observation):
+        if self._policy is None:
+            raise RuntimeError("policy is unavailable")
+        return self._policy.infer(observation)
+
+    def close(self) -> None:
+        _close_if_present(self._camera_reader)
+        self._camera_reader = None
+        self._feedback_reader.close()
+
+
+class ManifestCameraPairReader:
+    """Open only the two identities declared by the validated camera manifest."""
+
+    def __init__(self, manifest: dict[str, Any]) -> None:
+        import cv2
+        import pyrealsense2 as rs
+
+        self._cv2 = cv2
+        self._rs = rs
+        self._top = None
+        self._wrist = None
+        self._wrist_started = False
+        top = manifest["top"]
+        wrist = manifest["wrist"]
+        try:
+            self._top = cv2.VideoCapture(str(top["path"]))
+            if not self._top.isOpened():
+                raise RuntimeError(f"failed to open top camera identity: {top['path']}")
+            self._top.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*top["fourcc"]))
+            self._top.set(cv2.CAP_PROP_FRAME_WIDTH, top["width"])
+            self._top.set(cv2.CAP_PROP_FRAME_HEIGHT, top["height"])
+            self._top.set(cv2.CAP_PROP_FPS, top["fps"])
+
+            context = rs.context()
+            serials = [device.get_info(rs.camera_info.serial_number) for device in context.query_devices()]
+            if wrist["serial"] not in serials:
+                raise RuntimeError(f"wrist camera identity is missing: {wrist['serial']}")
+            self._wrist = rs.pipeline(context)
+            config = rs.config()
+            config.enable_device(wrist["serial"])
+            config.enable_stream(rs.stream.color, wrist["width"], wrist["height"], rs.format.bgr8, wrist["fps"])
+            self._wrist.start(config)
+            self._wrist_started = True
+            self._top_shape = (top["height"], top["width"], 3)
+            self._wrist_shape = (wrist["height"], wrist["width"], 3)
+            self._worker_sequence = 0
+        except Exception:
+            self.close()
+            raise
+
+    def read(self):
+        from scripts.verify_piper_joint2999_cameras import _system_timestamp_to_monotonic
+
+        ok, top_bgr = self._top.read()
+        top_host_receipt_monotonic = time.monotonic()
+        if not ok or top_bgr is None:
+            raise RuntimeError("top camera failed to return a frame")
+        frames = self._wrist.wait_for_frames(timeout_ms=1000)
+        wrist_frame = frames.get_color_frame()
+        if not wrist_frame:
+            raise RuntimeError("wrist camera failed to return a color frame")
+        wrist_bgr = np.asanyarray(wrist_frame.get_data())
+        if top_bgr.shape != self._top_shape or wrist_bgr.shape != self._wrist_shape:
+            raise RuntimeError(
+                f"camera shape mismatch: top={top_bgr.shape}, wrist={wrist_bgr.shape}"
+            )
+        wrist_host_receipt_monotonic = time.monotonic()
+        timestamp_domain = wrist_frame.get_frame_timestamp_domain()
+        if timestamp_domain == self._rs.timestamp_domain.system_time:
+            wrist_timestamp = _system_timestamp_to_monotonic(float(wrist_frame.get_timestamp()))
+        elif timestamp_domain == getattr(self._rs.timestamp_domain, "global_time", object()):
+            # Keep the global_time value as metadata only; freshness uses the
+            # bounded host receipt because no host mapping is exposed here.
+            wrist_timestamp = wrist_host_receipt_monotonic
+        else:
+            raise RuntimeError(f"wrist camera timestamp domain is not host-mappable: {timestamp_domain}")
+        if _stale_reason(_age(time.monotonic(), wrist_timestamp)) is not None:
+            raise RuntimeError("camera pair is stale")
+        pair_host_receipt_monotonic = max(top_host_receipt_monotonic, wrist_host_receipt_monotonic)
+        self._worker_sequence += 1
+        top_rgb = np.ascontiguousarray(top_bgr[:, :, ::-1])
+        wrist_rgb = np.ascontiguousarray(wrist_bgr[:, :, ::-1])
+        return top_rgb, wrist_rgb, pair_host_receipt_monotonic, self._worker_sequence
+
+    def close(self) -> None:
+        if self._top is not None:
+            self._top.release()
+            self._top = None
+        if self._wrist is not None and self._wrist_started:
+            self._wrist.stop()
+            self._wrist_started = False
+        self._wrist = None
+
+
+class ReadOnlyPiperCanFeedback:
+    """Decode passive Piper feedback from SocketCAN without configuring or sending."""
+
+    def __init__(self, can_interface: str) -> None:
+        self._interface = str(can_interface)
+        self._socket = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+        try:
+            self._socket.bind((self._interface,))
+            self._socket.settimeout(0.0)
+        except Exception:
+            self._socket.close()
+            raise
+        self._joints: dict[int, tuple[tuple[float, float], float]] = {}
+        self._gripper: tuple[float, float, int] | None = None
+        self._arm_status: tuple[int, int, float] | None = None
+        self._driver_codes: dict[int, tuple[int, float]] = {}
+
+    def probe(self, timeout_seconds: float = 1.0) -> dict[str, Any]:
+        self._receive(timeout_seconds)
+        feedback, feedback_timestamp = self._feedback_snapshot()
+        driver_status = self.driver_status()
+        return {
+            "feedback": feedback,
+            "feedback_timestamp": feedback_timestamp,
+            "feedback_age_seconds": _age(time.monotonic(), feedback_timestamp),
+            "driver_status": driver_status,
+        }
+
+    def read_feedback(self):
+        self._receive(0.002)
+        return self._feedback_snapshot()
+
+    def driver_status(self) -> dict[str, Any]:
+        if self._arm_status is None or self._gripper is None or len(self._driver_codes) != 6:
+            return {
+                "healthy": False,
+                "timestamp": float("-inf"),
+                "arm_status": None,
+                "arm_error_code": None,
+                "driver_fault_codes": [],
+                "gripper_status_code": None,
+                "reason": "INCOMPLETE_DRIVER_FEEDBACK",
+            }
+        arm_status, arm_error_code, arm_timestamp = self._arm_status
+        _, gripper_timestamp, gripper_status_code = self._gripper
+        driver_codes = [self._driver_codes[identifier][0] for identifier in _DRIVER_STATUS_IDS]
+        timestamp = min(
+            [arm_timestamp, gripper_timestamp]
+            + [self._driver_codes[identifier][1] for identifier in _DRIVER_STATUS_IDS]
+        )
+        healthy = (
+            arm_status == 0
+            and arm_error_code == 0
+            and not any(code & _DRIVER_FAULT_MASK for code in driver_codes)
+            and not gripper_status_code & _GRIPPER_FAULT_MASK
+        )
+        return {
+            "healthy": bool(healthy),
+            "timestamp": timestamp,
+            "arm_status": arm_status,
+            "arm_error_code": arm_error_code,
+            "driver_fault_codes": driver_codes,
+            "gripper_status_code": gripper_status_code,
+        }
+
+    def close(self) -> None:
+        self._socket.close()
+
+    def _feedback_snapshot(self) -> tuple[np.ndarray, float]:
+        if len(self._joints) != 3 or self._gripper is None:
+            raise RuntimeError("incomplete Piper joint/gripper feedback")
+        joint_values: list[float] = []
+        timestamps: list[float] = []
+        for identifier in _JOINT_FEEDBACK_IDS:
+            pair, timestamp = self._joints[identifier]
+            joint_values.extend(pair)
+            timestamps.append(timestamp)
+        gripper_m, gripper_timestamp, _ = self._gripper
+        timestamps.append(gripper_timestamp)
+        return np.array(joint_values + [gripper_m], dtype=np.float64), min(timestamps)
+
+    def _receive(self, timeout_seconds: float) -> None:
+        deadline = time.monotonic() + max(float(timeout_seconds), 0.0)
+        first = True
+        while first or time.monotonic() < deadline:
+            first = False
+            remaining = max(0.0, deadline - time.monotonic())
+            self._socket.settimeout(remaining)
+            try:
+                frame = self._socket.recv(_CAN_FRAME.size)
+            except (BlockingIOError, TimeoutError, socket.timeout):
+                break
+            self._decode_frame(frame, time.monotonic())
+            if self._complete() and timeout_seconds > 0.01:
+                break
+        self._socket.settimeout(0.0)
+
+    def _complete(self) -> bool:
+        return (
+            len(self._joints) == 3
+            and self._gripper is not None
+            and self._arm_status is not None
+            and len(self._driver_codes) == 6
+        )
+
+    def _decode_frame(self, frame: bytes, timestamp: float) -> None:
+        if len(frame) != _CAN_FRAME.size:
+            return
+        can_id, data_length, data = _CAN_FRAME.unpack(frame)
+        if can_id & 0x60000000 or data_length != 8:
+            return
+        identifier = can_id & 0x7FF
+        if identifier in _JOINT_FEEDBACK_IDS:
+            first, second = struct.unpack(">ii", data)
+            self._joints[identifier] = ((first / 1000.0, second / 1000.0), timestamp)
+        elif identifier == _GRIPPER_FEEDBACK_ID:
+            gripper_raw = struct.unpack(">i", data[:4])[0]
+            self._gripper = (gripper_raw / 1_000_000.0, timestamp, data[6])
+        elif identifier == _ARM_STATUS_ID:
+            self._arm_status = (data[1], int.from_bytes(data[6:8], "big"), timestamp)
+        elif identifier in _DRIVER_STATUS_IDS:
+            self._driver_codes[identifier] = (data[5], timestamp)
+
+
+class SocketCanAbsoluteJointWriteAdapter:
+    """Explicit direct CAN adapter for six absolute joints and one gripper value."""
+
+    explicit_real_write_adapter = True
+
+    def __init__(self, can_interface: str) -> None:
+        self._successful_can_write_count = 0
+        self._socket = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+        try:
+            self._socket.bind((str(can_interface),))
+        except Exception:
+            self._socket.close()
+            raise
+
+    def ready(self) -> bool:
+        return self._socket.fileno() >= 0
+
+    @property
+    def successful_can_write_count(self) -> int:
+        return self._successful_can_write_count
+
+    def enable(self) -> None:
+        self._send(0x151, bytes((0x01, 0x01, 50, 0x00, 0, 0, 0, 0)))
+        self._send(0x471, bytes((0x07, 0x02, 0, 0, 0, 0, 0, 0)))
+
+    def send_arm_absolute(self, command) -> None:
+        values = _finite_vector(command, 6, "absolute joint command")
+        raw = np.rint(values * 1000.0).astype(np.int64)
+        for identifier, offset in zip((0x155, 0x156, 0x157), (0, 2, 4), strict=True):
+            self._send(identifier, struct.pack(">ii", int(raw[offset]), int(raw[offset + 1])))
+
+    def send_gripper(self, target_m: float) -> None:
+        target = float(target_m)
+        if not math.isfinite(target):
+            raise ValueError("gripper target must be finite")
+        raw = int(round(target * 1_000_000.0))
+        self._send(0x159, struct.pack(">ihBB", raw, 1000, 0x01, 0x00))
+
+    def hold_stop(self, _reason: str) -> None:
+        self._send(0x150, bytes((0x01, 0, 0, 0, 0, 0, 0, 0)))
+
+    def close(self) -> None:
+        self._socket.close()
+
+    def _send(self, identifier: int, data: bytes) -> None:
+        frame = _CAN_FRAME.pack(identifier, len(data), data)
+        if self._socket.send(frame) != len(frame):
+            raise RuntimeError(f"short SocketCAN write for 0x{identifier:03X}")
+        self._successful_can_write_count += 1
+
+
+class _PreviewOnlySink:
+    def preview(self, _command) -> None:
+        return None
+
+
+@dataclass(frozen=True)
+class _FeedbackSnapshot:
+    values: np.ndarray
+    timestamp: float
+
+    def __post_init__(self) -> None:
+        values = _finite_vector(self.values, 7, "feedback mailbox values").copy()
+        values.setflags(write=False)
+        object.__setattr__(self, "values", values)
+
+
+class _LatestFeedbackMailbox:
+    """Thread-safe latest-only feedback snapshot shared with inference."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._latest: _FeedbackSnapshot | None = None
+
+    def put(self, values, timestamp: float) -> None:
+        snapshot = _FeedbackSnapshot(values, float(timestamp))
+        with self._lock:
+            self._latest = snapshot
+
+    def latest(self) -> _FeedbackSnapshot | None:
+        with self._lock:
+            return self._latest
+
+
+@dataclass(frozen=True)
+class _InferencePublication:
+    target: Target | None
+    camera_host_receipt_monotonic: float
+    camera_worker_sequence: int | None
+    feedback_timestamp: float
+    raw_action: np.ndarray | None
+    raw_gate: str
+    raw_gate_reason: str | None
+    safety_reason: str | None
+    inference_latency_seconds: float
+    inference_started_at: float
+    published_at: float
+
+
+class _InferencePublicationMailbox:
+    """Atomically pair worker metadata with the earlier latest-only Target mailbox."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._targets = LatestOnlyTargetMailbox()
+        self._pending: _InferencePublication | None = None
+
+    @property
+    def dropped_count(self) -> int:
+        return self._targets.dropped_count
+
+    def put(self, publication: _InferencePublication) -> None:
+        with self._condition:
+            if publication.target is None:
+                self._targets.take()
+            else:
+                self._targets.put(publication.target)
+            self._pending = replace(publication, target=None)
+            self._condition.notify_all()
+
+    def take(self) -> _InferencePublication | None:
+        with self._condition:
+            if self._pending is None:
+                return None
+            publication = self._pending
+            self._pending = None
+            target = self._targets.take()
+            return replace(publication, target=target)
+
+    def wait_for_pending(self, timeout_seconds: float) -> bool:
+        with self._condition:
+            if self._pending is not None:
+                return True
+            self._condition.wait(timeout=max(float(timeout_seconds), 0.0))
+            return self._pending is not None
+
+
+class CameraInferenceWorker:
+    """Read cameras and run synchronous policy inference outside the 50 Hz loop."""
+
+    def __init__(
+        self,
+        args,
+        dependencies,
+        feedback_mailbox: _LatestFeedbackMailbox,
+        publication_mailbox: _InferencePublicationMailbox,
+    ) -> None:
+        self._args = args
+        self._dependencies = dependencies
+        self._feedback_mailbox = feedback_mailbox
+        self._publication_mailbox = publication_mailbox
+        self._last_camera_sequence = None
+        self._generation = 0
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    def start(self) -> None:
+        if self._thread is not None:
+            raise RuntimeError("camera inference worker already started")
+        self._thread = threading.Thread(target=self._run, name="joint2999-camera-inference", daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout_seconds: float = 0.25) -> bool:
+        self._stop_event.set()
+        if self._thread is None:
+            return True
+        self._thread.join(timeout=max(float(timeout_seconds), 0.0))
+        return not self._thread.is_alive()
+
+    def process_once(self) -> str:
+        feedback = self._feedback_mailbox.latest()
+        if feedback is None:
+            return "NO_FEEDBACK"
+        camera_pair = self._dependencies.read_camera_pair()
+        if camera_pair is None:
+            return "NO_CAMERA"
+        top_rgb, wrist_rgb, camera_host_receipt, camera_sequence = _unpack_camera_pair(camera_pair)
+        if camera_sequence == self._last_camera_sequence:
+            return "DUPLICATE"
+        self._last_camera_sequence = camera_sequence
+
+        inference_started_at = _clock(self._dependencies)
+        observation = build_joint_observation(
+            top_rgb,
+            wrist_rgb,
+            feedback.values[:6],
+            feedback.values[6],
+            getattr(self._args, "prompt", PROMPT),
+        )
+        policy_output = self._dependencies.infer(observation)
+        published_at = _clock(self._dependencies)
+        raw_action = _first_action(policy_output)
+        inference_latency = published_at - inference_started_at
+        safety_reason = _stale_reason(
+            _age(published_at, inference_started_at),
+            _age(published_at, camera_host_receipt),
+            _age(published_at, feedback.timestamp),
+        )
+        if safety_reason is not None:
+            self._publication_mailbox.put(
+                _InferencePublication(
+                    target=None,
+                    camera_host_receipt_monotonic=float(camera_host_receipt),
+                    camera_worker_sequence=camera_sequence,
+                    feedback_timestamp=feedback.timestamp,
+                    raw_action=raw_action,
+                    raw_gate="SKIPPED",
+                    raw_gate_reason=None,
+                    safety_reason=safety_reason,
+                    inference_latency_seconds=inference_latency,
+                    inference_started_at=inference_started_at,
+                    published_at=published_at,
+                )
+            )
+            return "REJECTED"
+
+        self._generation += 1
+        target = Target(raw_action, inference_started_at, self._generation)
+        self._publication_mailbox.put(
+            _InferencePublication(
+                target=target,
+                camera_host_receipt_monotonic=float(camera_host_receipt),
+                camera_worker_sequence=camera_sequence,
+                feedback_timestamp=feedback.timestamp,
+                raw_action=raw_action,
+                raw_gate="PENDING",
+                raw_gate_reason=None,
+                safety_reason=None,
+                inference_latency_seconds=inference_latency,
+                inference_started_at=inference_started_at,
+                published_at=published_at,
+            )
+        )
+        return "PUBLISHED"
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            if self._feedback_mailbox.latest() is None:
+                self._stop_event.wait(0.001)
+                continue
+            try:
+                self.process_once()
+            except Exception as error:
+                now = _clock(self._dependencies)
+                self._publication_mailbox.put(
+                    _InferencePublication(
+                        target=None,
+                        camera_host_receipt_monotonic=float("-inf"),
+                        camera_worker_sequence=None,
+                        feedback_timestamp=float("-inf"),
+                        raw_action=None,
+                        raw_gate="SKIPPED",
+                        raw_gate_reason=None,
+                        safety_reason=f"WORKER_ERROR:{error}",
+                        inference_latency_seconds=0.0,
+                        inference_started_at=now,
+                        published_at=now,
+                    )
+                )
+                return
+
+
+def _run(args, dependencies, *, real: bool, write_adapter) -> dict[str, Any]:
+    output_dir = Path(getattr(args, "output_dir", Path("artifacts/direct_joint2999")))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = output_dir / ("joint2999_real.jsonl" if real else "joint2999_dry_run.jsonl")
+    feedback_mailbox = _LatestFeedbackMailbox()
+    publication_mailbox = _InferencePublicationMailbox()
+    inference_worker = CameraInferenceWorker(args, dependencies, feedback_mailbox, publication_mailbox)
+    executor = PhaseAwareExecutor(CONTROL_HZ, 0.50)
+    previous_accepted: np.ndarray | None = None
+    active_target: Target | None = None
+    active_camera_host_receipt: float | None = None
+    active_camera_sequence: int | None = None
+    active_raw_gate = "NOT_RUN"
+    last_gripper = None
+    last_gripper_timestamp = None
+    counters = {
+        "SAFETY_REJECT_COUNT": 0,
+        "COMMAND_SEND_COUNT": 0,
+        "ARM_ENABLE_COUNT": 0,
+        "STOP_ATTEMPT_COUNT": 0,
+        "STOP_DISPATCH_COUNT": 0,
+        "CAN_WRITE_COUNT": 0,
+    }
+    previews = 0
+    stop_reason = "DRY_RUN_COMPLETE" if not real else "MAX_TIME"
+    stop_attempted = False
+    stop_failure: str | None = None
+    worker_started = False
+    worker_stopped = True
+    worker_stop_reason = "NOT_STARTED"
+    write_attempted = False
+    fallback_can_write_count = 0
+    run_status = "PASS"
+    command_sink = write_adapter if real else dependencies.command_sink
+
+    def sync_can_write_count() -> None:
+        if not real:
+            return
+        observed = getattr(write_adapter, "successful_can_write_count", None)
+        if isinstance(observed, int) and not isinstance(observed, bool) and observed >= 0:
+            counters["CAN_WRITE_COUNT"] = observed
+        else:
+            counters["CAN_WRITE_COUNT"] = fallback_can_write_count
+
+    def record_uninstrumented_write() -> None:
+        nonlocal fallback_can_write_count
+        observed = getattr(write_adapter, "successful_can_write_count", None)
+        if not isinstance(observed, int) or isinstance(observed, bool):
+            fallback_can_write_count += 1
+        sync_can_write_count()
+
+    def stop_once(reason: str) -> None:
+        nonlocal run_status, stop_attempted, stop_failure
+        if not real or stop_attempted:
+            return
+        stop_attempted = True
+        counters["STOP_ATTEMPT_COUNT"] += 1
+        try:
+            write_adapter.hold_stop(reason)
+        except Exception as error:
+            stop_failure = f"{type(error).__name__}: {error}"
+            run_status = "FAIL"
+        else:
+            counters["STOP_DISPATCH_COUNT"] += 1
+            record_uninstrumented_write()
+        finally:
+            sync_can_write_count()
+
+    def poll_live_feedback() -> tuple[np.ndarray, float, float, dict[str, Any]]:
+        feedback, feedback_timestamp = dependencies.read_feedback()
+        feedback_array = _finite_vector(feedback, 7, "feedback")
+        feedback_timestamp = float(feedback_timestamp)
+        feedback_mailbox.put(feedback_array, feedback_timestamp)
+        polled_at = _clock(dependencies)
+        driver_status = _driver_status(dependencies)
+        return feedback_array, feedback_timestamp, polled_at, driver_status
+
+    def row_for_feedback(
+        feedback: np.ndarray,
+        feedback_timestamp: float,
+        checked_at: float,
+        driver_status: dict[str, Any],
+    ) -> dict[str, Any]:
+        camera_age = (
+            float("inf")
+            if active_camera_host_receipt is None
+            else _age(checked_at, active_camera_host_receipt)
+        )
+        return {
+            "timestamp": checked_at,
+            "feedback": feedback,
+            "camera_age_seconds": camera_age,
+            "can_age_seconds": _age(checked_at, feedback_timestamp),
+            "prior_accepted_target": previous_accepted,
+            "driver_status": driver_status,
+            "fresh_camera_snapshot": False,
+            "camera_worker_sequence": active_camera_sequence,
+            "camera_timestamp_kind": "host_receipt_monotonic_not_sensor_capture_time",
+            "raw_gate": active_raw_gate,
+        }
+
+    def preview_hold(
+        log_file,
+        row: dict[str, Any],
+        feedback: np.ndarray,
+        reason: str,
+    ) -> None:
+        nonlocal previews
+        hold_command = executor.step(
+            feedback[:6],
+            feedback[:6],
+            phase="NORMAL",
+            wrist_scale=1.0,
+        )
+        command_ok, command_reason = validate_executor_command(
+            hold_command,
+            feedback[:6],
+            CONTROL_DT,
+            DRIVER_SPEED_CAP_DEG_S,
+        )
+        deltas = hold_command - feedback[:6]
+        row.update(
+            {
+                "executor_command": hold_command,
+                "executor_gate": "PASS" if command_ok else "REJECT",
+                "executor_gate_reason": command_reason,
+                "joint_deltas_deg": deltas,
+                "joint_velocities_deg_s": deltas / CONTROL_DT,
+                "gripper_target_m": float(feedback[6]),
+                "gripper_send": False,
+                "gripper_keepalive": False,
+                "send_decision": "HOLD_PREVIEW" if command_ok else "NO_SEND",
+                "safety_reason": reason,
+            }
+        )
+        if command_ok:
+            command_sink.preview(
+                {
+                    "joints_deg": hold_command,
+                    "gripper_m": float(feedback[6]),
+                    "generation_id": None if active_target is None else active_target.generation_id,
+                    "hold": True,
+                    "reason": reason,
+                }
+            )
+            previews += 1
+        _write_row(log_file, row)
+
+    def reject_or_hold(
+        log_file,
+        row: dict[str, Any],
+        feedback: np.ndarray,
+        reason: str,
+        *,
+        count_reject: bool = True,
+    ) -> bool:
+        nonlocal run_status, stop_reason
+        if count_reject:
+            counters["SAFETY_REJECT_COUNT"] += 1
+        if real:
+            run_status = "FAIL"
+            stop_reason = reason
+            row.update({"send_decision": "HOLD_STOP", "safety_reason": reason})
+            _write_row(log_file, row)
+            stop_once(reason)
+            return True
+        preview_hold(log_file, row, feedback, reason)
+        return False
+
+    try:
+        with log_path.open("w", encoding="utf-8") as log_file:
+            feedback, feedback_timestamp, checked_at, driver_status = poll_live_feedback()
+            initial_reason = _stale_reason(_age(checked_at, feedback_timestamp))
+            if initial_reason is None:
+                initial_reason = _driver_abort_reason(driver_status, checked_at)
+
+            run_loop = True
+            if real and initial_reason is not None:
+                stop_reason = initial_reason
+                row = row_for_feedback(feedback, feedback_timestamp, checked_at, driver_status)
+                row.update(
+                    {
+                        "raw_gate": "SKIPPED",
+                        "send_decision": "HOLD_STOP",
+                        "safety_reason": stop_reason,
+                    }
+                )
+                _write_row(log_file, row)
+                stop_once(stop_reason)
+                run_loop = False
+
+            if run_loop:
+                inference_worker.start()
+                worker_started = True
+                publication_ready = publication_mailbox.wait_for_pending(FIRST_TARGET_TIMEOUT_SECONDS)
+            else:
+                publication_ready = False
+
+            if real and run_loop and not publication_ready:
+                stop_reason = "NO_TARGET"
+                row = row_for_feedback(feedback, feedback_timestamp, checked_at, driver_status)
+                row.update(
+                    {
+                        "raw_gate": "NOT_RUN",
+                        "send_decision": "NO_SEND",
+                        "safety_reason": stop_reason,
+                    }
+                )
+                _write_row(log_file, row)
+                run_loop = False
+
+            if real and run_loop:
+                feedback, feedback_timestamp, checked_at, driver_status = poll_live_feedback()
+                startup_reason = _stale_reason(_age(checked_at, feedback_timestamp))
+                if startup_reason is None:
+                    startup_reason = _driver_abort_reason(driver_status, checked_at)
+                if startup_reason is not None:
+                    stop_reason = startup_reason
+                    row = row_for_feedback(feedback, feedback_timestamp, checked_at, driver_status)
+                    row.update(
+                        {
+                            "raw_gate": "SKIPPED",
+                            "send_decision": "NO_SEND",
+                            "safety_reason": stop_reason,
+                        }
+                    )
+                    _write_row(log_file, row)
+                    run_loop = False
+
+            if real and run_loop:
+                write_attempted = True
+                try:
+                    write_adapter.enable()
+                except Exception:
+                    run_status = "FAIL"
+                    sync_can_write_count()
+                    stop_reason = "WRITE_FAILURE:ENABLE"
+                    row = row_for_feedback(feedback, feedback_timestamp, checked_at, driver_status)
+                    row.update(
+                        {
+                            "raw_gate": "SKIPPED",
+                            "send_decision": "WRITE_FAILURE",
+                            "safety_reason": stop_reason,
+                        }
+                    )
+                    _write_row(log_file, row)
+                    stop_once(stop_reason)
+                    run_loop = False
+                else:
+                    counters["ARM_ENABLE_COUNT"] += 1
+                    record_uninstrumented_write()
+
+            start = _clock(dependencies)
+            deadline = start + min(float(getattr(args, "max_time", 60.0)), 60.0)
+            next_tick = start
+            while run_loop and _clock(dependencies) <= deadline:
+                tick_now = _clock(dependencies)
+                if tick_now < next_tick:
+                    _sleep(dependencies, next_tick - tick_now)
+                    continue
+                next_tick = tick_now + CONTROL_DT
+
+                feedback, feedback_timestamp, check_now, driver_status = poll_live_feedback()
+                row = row_for_feedback(feedback, feedback_timestamp, check_now, driver_status)
+                publication = publication_mailbox.take()
+                if publication is not None:
+                    row.update(
+                        {
+                            "fresh_camera_snapshot": publication.camera_worker_sequence is not None,
+                            "camera_worker_sequence": publication.camera_worker_sequence,
+                            "raw_action": publication.raw_action,
+                            "raw_target": publication.raw_action,
+                            "raw_gate": publication.raw_gate,
+                            "raw_gate_reason": publication.raw_gate_reason,
+                            "inference_latency_seconds": publication.inference_latency_seconds,
+                            "publication_plan_age_seconds": _age(
+                                check_now,
+                                publication.inference_started_at,
+                            ),
+                            "publication_camera_age_seconds": _age(
+                                check_now,
+                                publication.camera_host_receipt_monotonic,
+                            ),
+                            "publication_can_age_seconds": _age(
+                                check_now,
+                                publication.feedback_timestamp,
+                            ),
+                        }
+                    )
+                    if publication.safety_reason is not None or publication.target is None:
+                        active_target = None
+                        active_camera_host_receipt = None
+                        active_camera_sequence = None
+                        active_raw_gate = "SKIPPED"
+                        row["raw_gate"] = "SKIPPED"
+                        reason = publication.safety_reason or "NO_TARGET"
+                        if reject_or_hold(log_file, row, feedback, reason):
+                            break
+                        continue
+
+                    # This drain is intentionally after inference publication. It is
+                    # never substituted with the snapshot used to build the observation.
+                    feedback, feedback_timestamp, check_now, driver_status = poll_live_feedback()
+                    row.update(
+                        {
+                            "timestamp": check_now,
+                            "feedback": feedback,
+                            "can_age_seconds": _age(check_now, feedback_timestamp),
+                            "driver_status": driver_status,
+                            "publication_plan_age_seconds": _age(
+                                check_now,
+                                publication.target.timestamp,
+                            ),
+                            "publication_camera_age_seconds": _age(
+                                check_now,
+                                publication.camera_host_receipt_monotonic,
+                            ),
+                            "publication_can_age_seconds": _age(check_now, feedback_timestamp),
+                        }
+                    )
+                    publication_reason = _stale_reason(
+                        row["publication_plan_age_seconds"],
+                        row["publication_camera_age_seconds"],
+                        row["publication_can_age_seconds"],
+                    )
+                    if publication_reason is None:
+                        publication_reason = _driver_abort_reason(driver_status, check_now)
+                    if publication_reason is not None:
+                        active_target = None
+                        active_camera_host_receipt = None
+                        active_camera_sequence = None
+                        active_raw_gate = "SKIPPED"
+                        row["raw_gate"] = "SKIPPED"
+                        if reject_or_hold(log_file, row, feedback, publication_reason):
+                            break
+                        continue
+
+                    reference = feedback if previous_accepted is None else previous_accepted
+                    raw_ok, raw_reason = validate_raw_target(publication.target.values, reference)
+                    active_raw_gate = "PASS" if raw_ok else "REJECT"
+                    row.update({"raw_gate": active_raw_gate, "raw_gate_reason": raw_reason})
+                    if not raw_ok:
+                        active_target = None
+                        active_camera_host_receipt = None
+                        active_camera_sequence = None
+                        reason = f"SAFETY_ABORT:{raw_reason}"
+                        if reject_or_hold(log_file, row, feedback, reason):
+                            break
+                        continue
+
+                    active_target = publication.target
+                    active_camera_host_receipt = publication.camera_host_receipt_monotonic
+                    active_camera_sequence = publication.camera_worker_sequence
+                    previous_accepted = active_target.values
+
+                if active_target is None:
+                    row["raw_gate"] = "NOT_RUN" if active_raw_gate == "NOT_RUN" else active_raw_gate
+                    if reject_or_hold(
+                        log_file,
+                        row,
+                        feedback,
+                        "NO_TARGET",
+                        count_reject=False,
+                    ):
+                        break
+                    continue
+
+                execution_now = _clock(dependencies)
+                target_age = _age(execution_now, active_target.timestamp)
+                target_camera_age = _age(execution_now, active_camera_host_receipt)
+                current_feedback_age = _age(execution_now, feedback_timestamp)
+                execution_reason = _stale_reason(
+                    target_age,
+                    target_camera_age,
+                    current_feedback_age,
+                )
+                if execution_reason is None:
+                    execution_reason = _driver_abort_reason(driver_status, execution_now)
+                row.update(
+                    {
+                        "raw_action": active_target.values,
+                        "raw_target": active_target.values,
+                        "raw_gate": active_raw_gate,
+                        "target_age_seconds": target_age,
+                        "camera_age_seconds": target_camera_age,
+                        "can_age_seconds": current_feedback_age,
+                        "driver_status": driver_status,
+                    }
+                )
+                if execution_reason is not None:
+                    if reject_or_hold(log_file, row, feedback, execution_reason):
+                        break
+                    continue
+
+                command = executor.step(
+                    feedback[:6],
+                    active_target.values[:6],
+                    phase="NORMAL",
+                    wrist_scale=1.0,
+                )
+                command_ok, command_reason = validate_executor_command(
+                    command,
+                    feedback[:6],
+                    CONTROL_DT,
+                    DRIVER_SPEED_CAP_DEG_S,
+                )
+                deltas = command - feedback[:6]
+                row.update(
+                    {
+                        "executor_command": command,
+                        "executor_gate": "PASS" if command_ok else "REJECT",
+                        "executor_gate_reason": command_reason,
+                        "joint_deltas_deg": deltas,
+                        "joint_velocities_deg_s": deltas / CONTROL_DT,
+                        "gripper_target_m": active_target.values[6],
+                    }
+                )
+                if not command_ok:
+                    if reject_or_hold(
+                        log_file,
+                        row,
+                        feedback,
+                        f"SAFETY_ABORT:{command_reason}",
+                    ):
+                        break
+                    continue
+
+                # Drain passive CAN feedback and driver frames immediately before
+                # the final gate and possible send. No earlier snapshot is reused.
+                final_feedback, final_feedback_timestamp, final_now, final_driver_status = (
+                    poll_live_feedback()
+                )
+                final_target_age = _age(final_now, active_target.timestamp)
+                final_camera_age = _age(final_now, active_camera_host_receipt)
+                final_feedback_age = _age(final_now, final_feedback_timestamp)
+                final_reason = _stale_reason(
+                    final_target_age,
+                    final_camera_age,
+                    final_feedback_age,
+                )
+                if final_reason is None:
+                    final_reason = _driver_abort_reason(final_driver_status, final_now)
+                final_command_ok, final_command_reason = validate_executor_command(
+                    command,
+                    final_feedback[:6],
+                    CONTROL_DT,
+                    DRIVER_SPEED_CAP_DEG_S,
+                )
+                if final_reason is None and not final_command_ok:
+                    final_reason = f"SAFETY_ABORT:{final_command_reason}"
+                gripper_send, keepalive = gripper_send_decision(
+                    active_target.values[6],
+                    last_gripper,
+                    last_gripper_timestamp,
+                    final_now,
+                )
+                final_deltas = command - final_feedback[:6]
+                row.update(
+                    {
+                        "send_check_timestamp": final_now,
+                        "feedback": final_feedback,
+                        "target_age_seconds": final_target_age,
+                        "camera_age_seconds": final_camera_age,
+                        "can_age_seconds": final_feedback_age,
+                        "driver_status": final_driver_status,
+                        "executor_gate": "PASS" if final_command_ok else "REJECT",
+                        "executor_gate_reason": final_command_reason,
+                        "joint_deltas_deg": final_deltas,
+                        "joint_velocities_deg_s": final_deltas / CONTROL_DT,
+                        "gripper_send": gripper_send,
+                        "gripper_keepalive": keepalive,
+                    }
+                )
+                if final_reason is not None:
+                    if reject_or_hold(log_file, row, final_feedback, final_reason):
+                        break
+                    continue
+
+                command_record = {
+                    "joints_deg": command,
+                    "gripper_m": active_target.values[6],
+                    "generation_id": active_target.generation_id,
+                }
+                if real:
+                    write_attempted = True
+                    try:
+                        command_sink.send_arm_absolute(command)
+                    except Exception:
+                        run_status = "FAIL"
+                        sync_can_write_count()
+                        stop_reason = "WRITE_FAILURE:ARM_COMMAND"
+                        counters["SAFETY_REJECT_COUNT"] += 1
+                        row.update(
+                            {
+                                "send_decision": "WRITE_FAILURE",
+                                "safety_reason": stop_reason,
+                            }
+                        )
+                        _write_row(log_file, row)
+                        stop_once(stop_reason)
+                        break
+                    counters["COMMAND_SEND_COUNT"] += 1
+                    record_uninstrumented_write()
+                    if gripper_send:
+                        try:
+                            command_sink.send_gripper(active_target.values[6])
+                        except Exception:
+                            run_status = "FAIL"
+                            sync_can_write_count()
+                            stop_reason = "WRITE_FAILURE:GRIPPER_COMMAND"
+                            counters["SAFETY_REJECT_COUNT"] += 1
+                            row.update(
+                                {
+                                    "send_decision": "WRITE_FAILURE",
+                                    "safety_reason": stop_reason,
+                                }
+                            )
+                            _write_row(log_file, row)
+                            stop_once(stop_reason)
+                            break
+                        counters["COMMAND_SEND_COUNT"] += 1
+                        record_uninstrumented_write()
+                        last_gripper = float(active_target.values[6])
+                        last_gripper_timestamp = final_now
+                    row["send_decision"] = "SENT"
+                else:
+                    command_sink.preview(command_record)
+                    previews += 1
+                    row["send_decision"] = "PREVIEW_ONLY"
+                _write_row(log_file, row)
+    except Exception as error:
+        run_status = "FAIL"
+        stop_reason = f"RUNTIME_EXCEPTION:{error}"
+        if real and write_attempted:
+            stop_once(stop_reason)
+    finally:
+        if real and write_attempted and not stop_attempted:
+            stop_once(stop_reason)
+        if worker_started:
+            worker_stopped = inference_worker.stop(timeout_seconds=STALE_AFTER_SECONDS)
+            worker_stop_reason = "STOPPED" if worker_stopped else "TIMEOUT"
+        if not worker_stopped:
+            run_status = "FAIL"
+            if stop_reason in {"DRY_RUN_COMPLETE", "MAX_TIME"}:
+                stop_reason = "CAMERA_INFERENCE_WORKER_STOP_TIMEOUT"
+        sync_can_write_count()
+
+    report = {
+        "REAL_ROBOT_EXECUTED": "YES" if real and counters["CAN_WRITE_COUNT"] else "NO",
+        "REAL_CAN_WRITE": "YES" if real and counters["CAN_WRITE_COUNT"] else "NO",
+        "ARM_ENABLE_COUNT": counters["ARM_ENABLE_COUNT"],
+        "COMMAND_SEND_COUNT": counters["COMMAND_SEND_COUNT"],
+        "STOP_ATTEMPT_COUNT": counters["STOP_ATTEMPT_COUNT"],
+        "STOP_DISPATCH_COUNT": counters["STOP_DISPATCH_COUNT"],
+        "CAN_WRITE_COUNT": counters["CAN_WRITE_COUNT"],
+        "SAFETY_REJECT_COUNT": counters["SAFETY_REJECT_COUNT"],
+        "LATEST_TARGET_GENERATION": inference_worker.generation,
+        "MAILBOX_DROPPED_COUNT": publication_mailbox.dropped_count,
+        "preview_count": previews,
+        "STOP_REASON": stop_reason,
+        "STOP_FAILURE": stop_failure,
+        "CAMERA_INFERENCE_WORKER_STOPPED": "YES" if worker_stopped else "NO",
+        "CAMERA_INFERENCE_WORKER_STOP_REASON": worker_stop_reason,
+        "RUN_STATUS": run_status,
+        "LOG": str(log_path),
+        "TASK_PHASE_REACHED": "PREPARED_DRY_RUN" if not real else "REAL_RUN",
+        "TASK_COMPLETE": "NO",
+        "FREEZE_CURRENT_EXPERIMENT": "NO",
+        "VIDEO": "N/A",
+        "REPORT": "N/A",
+        "MAX_TIME_SECONDS": min(float(getattr(args, "max_time", 60.0)), 60.0),
+    }
+    return report
+
+
+def _unpack_camera_pair(camera_pair):
+    if len(camera_pair) != 4:
+        raise ValueError(
+            "camera pair requires top, wrist, bounded host receipt, and stable worker/source sequence"
+        )
+    top_rgb, wrist_rgb, host_receipt_monotonic, worker_sequence = camera_pair
+    host_receipt_monotonic = float(host_receipt_monotonic)
+    if not math.isfinite(host_receipt_monotonic):
+        raise ValueError("camera host-receipt liveness timestamp must be finite")
+    if (
+        not isinstance(worker_sequence, int)
+        or isinstance(worker_sequence, bool)
+        or worker_sequence < 0
+    ):
+        raise ValueError("camera pair requires a stable integer worker/source sequence")
+    return top_rgb, wrist_rgb, host_receipt_monotonic, worker_sequence
+
+
+def _camera_to_channel_first(image, name: str) -> np.ndarray:
+    array = np.asarray(image)
+    if array.shape != (480, 640, 3):
+        raise ValueError(f"{name} image must have shape (480, 640, 3)")
+    if not np.isfinite(array).all():
+        raise ValueError(f"{name} image must be finite")
+    return np.ascontiguousarray(array.transpose(2, 0, 1))
+
+
+def _finite_vector(value, size: int, name: str) -> np.ndarray:
+    array = np.asarray(value, dtype=np.float64)
+    if array.shape != (size,) or not np.isfinite(array).all():
+        raise ValueError(f"{name} must be finite shape ({size},)")
+    return array
+
+
+def _first_action(policy_output) -> np.ndarray:
+    try:
+        actions = np.asarray(policy_output["actions"], dtype=np.float64)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("policy output requires actions") from error
+    if actions.ndim != 2 or actions.shape[0] < 1 or actions.shape[1] != 7:
+        raise ValueError("policy actions must have shape (horizon, 7)")
+    return actions[0].copy()
+
+
+def _clock(dependencies) -> float:
+    now = float(dependencies.monotonic()) if hasattr(dependencies, "monotonic") else time.monotonic()
+    if not math.isfinite(now):
+        raise ValueError("monotonic clock must be finite")
+    return now
+
+
+def _age(now: float, timestamp) -> float:
+    value = float(timestamp)
+    if not math.isfinite(value):
+        return float("inf")
+    return now - value if now >= value else float("inf")
+
+
+def _stale_reason(*ages: float) -> str | None:
+    return "STALE_DATA_HOLD" if any(not math.isfinite(age) or age > STALE_AFTER_SECONDS for age in ages) else None
+
+
+def _driver_status(dependencies) -> dict[str, Any]:
+    if not hasattr(dependencies, "driver_status"):
+        return {"healthy": False, "timestamp": float("-inf"), "reason": "DRIVER_STATUS_UNAVAILABLE"}
+    status = dependencies.driver_status()
+    if not isinstance(status, dict):
+        return {"healthy": False, "timestamp": float("-inf"), "reason": "DRIVER_STATUS_INVALID"}
+    return status
+
+
+def _driver_abort_reason(status: dict[str, Any], now: float) -> str | None:
+    if status.get("healthy") is not True:
+        return "DRIVER_FAULT_HOLD"
+    if _stale_reason(_age(now, status.get("timestamp", float("-inf")))) is not None:
+        return "STALE_DATA_HOLD"
+    return None
+
+
+def _validate_camera_probe_report(report: Any, manifest: dict[str, Any]) -> None:
+    if not isinstance(report, dict):
+        raise ValueError("camera probe report must be a mapping")
+    for name in ("top", "wrist"):
+        camera_report = report.get(name)
+        if not isinstance(camera_report, dict):
+            raise ValueError(f"camera probe report is missing {name}")
+        expected_identity = manifest[name]["path"] if name == "top" else manifest[name]["serial"]
+        if str(camera_report.get("resolved_identity")) != str(Path(expected_identity).resolve() if name == "top" else expected_identity):
+            raise ValueError(f"{name} camera resolved identity does not match the manifest")
+        expected_shape = {
+            "width": int(manifest[name]["width"]),
+            "height": int(manifest[name]["height"]),
+            "channels": 3,
+        }
+        if camera_report.get("actual_shape") != expected_shape:
+            raise ValueError(f"{name} camera shape does not match the manifest")
+        age = camera_report.get("freshness_age_seconds")
+        if camera_report.get("freshness_verifiable") is not True or not isinstance(age, (int, float)):
+            raise ValueError(f"{name} camera freshness is not verifiable")
+        if not math.isfinite(float(age)) or float(age) < 0.0:
+            raise ValueError(f"{name} camera freshness age is invalid")
+
+    top_report = report["top"]
+    if top_report.get("freshness_contract") != "bounded_host_receipt_sequence_liveness":
+        raise ValueError("top camera host-receipt sequence liveness is unavailable")
+    if top_report.get("timestamp_source") != "host_receipt_monotonic_not_sensor_capture_time":
+        raise ValueError("top camera liveness timestamp is mislabeled")
+    if top_report.get("source_capture_timestamp_available") is not False:
+        raise ValueError("top camera must report unavailable source capture timestamps")
+    if top_report.get("bounded_buffer_capacity") != 1:
+        raise ValueError("top camera liveness buffer must be latest-only")
+    if not isinstance(top_report.get("worker_sequence"), int) or top_report["worker_sequence"] < 2:
+        raise ValueError("top camera worker sequence did not advance")
+    host_receipt = top_report.get("host_receipt_monotonic_seconds")
+    if not isinstance(host_receipt, (int, float)) or not math.isfinite(float(host_receipt)):
+        raise ValueError("top camera host-receipt timestamp is invalid")
+
+    wrist_report = report["wrist"]
+    wrist_timestamp_source = wrist_report.get("timestamp_source")
+    if wrist_timestamp_source == "realsense_system_time_mapped_to_host_monotonic":
+        if wrist_report.get("source_capture_timestamp_available") is not True:
+            raise ValueError("wrist camera source timestamp is unavailable")
+    elif wrist_timestamp_source == "host_receipt_monotonic_not_sensor_capture_time":
+        if wrist_report.get("freshness_contract") != "bounded_host_receipt_sequence_liveness":
+            raise ValueError("wrist host-receipt freshness contract is unavailable")
+        if wrist_report.get("source_capture_timestamp_available") is not False:
+            raise ValueError("wrist host-receipt timestamp is mislabeled")
+        host_receipt = wrist_report.get("host_receipt_monotonic_seconds")
+        if not isinstance(host_receipt, (int, float)) or not math.isfinite(float(host_receipt)):
+            raise ValueError("wrist host-receipt timestamp is invalid")
+    else:
+        raise ValueError("wrist camera freshness timestamp is not supported")
+
+
+def _require_explicit_write_adapter(write_adapter, *, check_ready: bool) -> None:
+    required_methods = ("enable", "send_arm_absolute", "send_gripper", "hold_stop")
+    if write_adapter is None or getattr(write_adapter, "explicit_real_write_adapter", False) is not True:
+        raise RuntimeError("real mode requires an explicit absolute Joint write adapter")
+    if any(not callable(getattr(write_adapter, method, None)) for method in required_methods):
+        raise RuntimeError("explicit absolute Joint write adapter is incomplete")
+    write_count = getattr(write_adapter, "successful_can_write_count", None)
+    if not isinstance(write_count, int) or isinstance(write_count, bool) or write_count < 0:
+        raise RuntimeError("explicit absolute Joint write adapter lacks CAN-write accounting")
+    if check_ready and (not callable(getattr(write_adapter, "ready", None)) or not write_adapter.ready()):
+        raise RuntimeError("explicit absolute Joint write adapter is not ready")
+
+
+def _build_explicit_write_adapter(args):
+    if getattr(args, "write_adapter", None) != SOCKETCAN_WRITE_ADAPTER:
+        raise RuntimeError(f"real mode requires --write-adapter {SOCKETCAN_WRITE_ADAPTER}")
+    return SocketCanAbsoluteJointWriteAdapter(str(getattr(args, "can_interface", CAN_INTERFACE)))
+
+
+def _sleep(dependencies, seconds: float) -> None:
+    if hasattr(dependencies, "sleep"):
+        dependencies.sleep(seconds)
+    else:
+        time.sleep(seconds)
+
+
+def _close_if_present(value) -> None:
+    if value is not None and hasattr(value, "close"):
+        value.close()
+
+
+def _write_row(log_file, row: dict[str, Any]) -> None:
+    log_file.write(json.dumps(_json_value(row), sort_keys=True) + "\n")
+    log_file.flush()
+
+
+def _json_value(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item) for item in value]
+    return value
+
+
+def _hash_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    if not path.exists():
+        return "MISSING"
+    if path.is_file():
+        digest.update(path.read_bytes())
+        return digest.hexdigest()
+    for item in sorted(entry for entry in path.rglob("*") if entry.is_file()):
+        digest.update(str(item.relative_to(path)).encode())
+        with item.open("rb") as asset:
+            for block in iter(lambda: asset.read(1024 * 1024), b""):
+                digest.update(block)
+    return digest.hexdigest()
+
+
+def _positive_duration(value: str) -> float:
+    duration = float(value)
+    if not math.isfinite(duration) or duration <= 0.0 or duration > 60.0:
+        raise argparse.ArgumentTypeError("--max-time must be finite, positive, and at most 60 seconds")
+    return duration
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
