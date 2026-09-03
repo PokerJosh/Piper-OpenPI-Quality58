@@ -437,7 +437,7 @@ class LeRobotPiperJointRTCQuality58DataConfig(DataConfigFactory):
     mask_path: str = (
         "<DATA_QA_ROOT>/joint_rtc_expert_salvage_20260901T161500Z/FINAL_TRAIN_SAMPLE_MASK.json"
     )
-    nominal_root: str = "<NOMINAL_DATASET_ROOT>"
+    nominal_root: str = "<DATASET_ROOT>/local/piper_openpi_v21"
     recovery_root: str = (
         "<DATASET_ROOT>/"
         "piper_openpi_v21_recovery_v1_reviewed_clean_11ep"
@@ -1141,7 +1141,7 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "<CHECKPOINT_ROOT>/pi05_piper_tcp_delta_v2_finetune/"
+            "<CHECKPOINT_ROOT>/checkpoints/pi05_piper_tcp_delta_v2_finetune/"
             "pi05_piper_tcp_v2_10k_20260825_151843/9999/params"
         ),
         num_train_steps=4_000,
@@ -1189,7 +1189,7 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "<CHECKPOINT_ROOT>/pi05_piper_tcp_delta_v2_finetune/"
+            "<CHECKPOINT_ROOT>/checkpoints/pi05_piper_tcp_delta_v2_finetune/"
             "pi05_piper_tcp_v2_10k_20260825_151843/9999/params"
         ),
         num_train_steps=3_000,
@@ -1222,7 +1222,7 @@ _CONFIGS = [
             repo_id="local/piper_joint_recovery_mix_103ep",
             base_config=DataConfig(prompt_from_task=True),
         ),
-        checkpoint_base_dir="<CHECKPOINT_ROOT>",
+        checkpoint_base_dir="<CHECKPOINT_ROOT>/checkpoints",
         batch_size=16,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=100,
@@ -1234,7 +1234,7 @@ _CONFIGS = [
         # Params-only loader: the new TrainState initializes step=0 and creates
         # a fresh optimizer/scheduler state; it never restores train_state.
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "<CHECKPOINT_ROOT>/pi05_piper_low_mem_finetune/"
+            "<PIPER_PROJECT_ROOT>/openpi_final_retry/pi05_piper_low_mem_finetune/"
             "pi05_piper_92ep_7500_to_10k_20260823_235331/9999/params"
         ),
         num_train_steps=3_000,
@@ -1270,7 +1270,7 @@ _CONFIGS = [
         data=LeRobotPiperJointRTCQuality58DataConfig(
             assets=AssetsConfig(asset_id="local/piper_joint_rtc_quality58"),
         ),
-        checkpoint_base_dir="<CHECKPOINT_ROOT>",
+        checkpoint_base_dir="<CHECKPOINT_ROOT>/checkpoints",
         batch_size=16,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=100,
@@ -1281,7 +1281,7 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         # Params-only initialization; optimizer/train state starts fresh.
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "<CHECKPOINT_ROOT>/"
+            "<CHECKPOINT_ROOT>/checkpoints/"
             "pi05_piper_joint_recovery_mix_finetune/"
             "pi05_piper_joint_recovery_mix_103ep_3k_20260831_133508_fastfinish/"
             "2999/params"

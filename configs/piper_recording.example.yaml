@@ -1,0 +1,35 @@
+robot:
+  type: piper
+  can_name: <CAN_INTERFACE>
+  enable_motion: true
+  max_relative_target_deg: 30.0
+  max_joint_speed_deg_s: 50.0
+  motion_command_duration_s: 0.02
+  cameras:
+    wrist:
+      type: intelrealsense
+      serial_number_or_name: "<WRIST_CAMERA_SERIAL>"
+      fps: 30
+      width: 640
+      height: 480
+    top:
+      type: opencv
+      index_or_path: <TOP_CAMERA_DEVICE_PATH>
+      fps: 30
+      width: 640
+      height: 480
+teleop:
+  type: piper_leader
+  port: <LEADER_SERIAL_PORT>
+  leader_kit_path: <PIPER_PROJECT_ROOT>/hardware/piper_leader_kit
+  require_all_servos: false
+  max_tick_jump: 0
+dataset:
+  repo_id: local/piper_demo
+  single_task: "<TASK_DESCRIPTION>"
+  num_episodes: 5
+  fps: 30
+  push_to_hub: false
+  private: true
+  root: <DATASET_ROOT>
+display_data: false

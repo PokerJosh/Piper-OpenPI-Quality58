@@ -1,26 +1,212 @@
-diff --git a/configs/piper_joint2999_camera.yaml b/configs/piper_joint2999_camera.yaml
-new file mode 100644
-index 0000000..d87721e
---- /dev/null
-+++ b/configs/piper_joint2999_camera.yaml
-@@ -0,0 +1,13 @@
-+top:
-+  kind: opencv
-+  path: <TOP_CAMERA_DEVICE_PATH>
-+  fourcc: MJPG
-+  width: 640
-+  height: 480
-+  fps: 30
-+wrist:
-+  kind: intelrealsense
-+  serial: "<REDACTED>"
-+  width: 640
-+  height: 480
-+  fps: 30
-diff --git a/scripts/pi05_joint2999_rollout.py b/scripts/pi05_joint2999_rollout.py
-new file mode 100644
-index 0000000..e668677
---- /dev/null
+# Sanitized archive patch: Direct Joint2999 deployment additions# This is an audit-oriented source snapshot; it excludes local paths, data, weights, and secrets.
+
+--- a/src/openpi/rollouts/direct_joint_core.py
++++ b/src/openpi/rollouts/direct_joint_core.py
+@@ -0,0 +1,203 @@
++"""Pure safety and execution primitives for absolute seven-value targets."""
++
++from __future__ import annotations
++
++import threading
++from dataclasses import dataclass
++
++import numpy as np
++
++ARM_DIM = 6
++TARGET_DIM = 7
++RAW_CONTINUITY_DEG = 5.0
++EXECUTOR_STEP_DEG = 1.0
++PHASE_VMAX_DEG_S = np.array([10.0, 12.0, 12.0, 3.0, 3.0, 3.0], dtype=np.float64)
++PHYSICAL_HARD_LIMITS = np.array(
++    [(-150.0, 124.22), (0.0, 179.91), (-170.0, 0.0),
++     (-99.98, 99.98), (-69.90, 69.90), (-120.0, 120.0)],
++    dtype=np.float64,
++)
++DEPLOYMENT_SOFT_LIMITS = np.array(
++    [(-149.0, 123.22), (1.0, 178.91), (-169.0, -0.30),
++     (-98.98, 98.98), (-68.90, 68.90), (-119.0, 119.0)],
++    dtype=np.float64,
++)
++GRIPPER_LIMITS_M = (0.0, 0.07)
++GRIPPER_CHANGE_M = 0.0005
++GRIPPER_KEEPALIVE_S = 5.0
++
++
++@dataclass(frozen=True)
++class Target:
++    """One absolute target in [J1, J2, J3, J4, J5, J6, gripper] order."""
++
++    values: np.ndarray
++    timestamp: float
++    generation_id: int
++
++    def __post_init__(self) -> None:
++        values = np.asarray(self.values, dtype=np.float64)
++        if values.shape != (TARGET_DIM,):
++            raise ValueError("target must have shape (7,)")
++        snapshot = values.copy()
++        snapshot.setflags(write=False)
++        object.__setattr__(self, "values", snapshot)
++
++
++class LatestOnlyTargetMailbox:
++    """Thread-safe single-slot mailbox with overwrite accounting."""
++
++    def __init__(self) -> None:
++        self._lock = threading.Lock()
++        self._pending: Target | None = None
++        self._dropped_count = 0
++
++    @property
++    def dropped_count(self) -> int:
++        with self._lock:
++            return self._dropped_count
++
++    def put(self, target: Target) -> None:
++        if not isinstance(target, Target):
++            raise TypeError("target must be a Target")
++        with self._lock:
++            if self._pending is not None:
++                self._dropped_count += 1
++            self._pending = target
++
++    def take(self) -> Target | None:
++        with self._lock:
++            target = self._pending
++            self._pending = None
++            return target
++
++
++def _vector(value: object, size: int) -> np.ndarray | None:
++    try:
++        array = np.asarray(value, dtype=np.float64)
++    except (TypeError, ValueError):
++        return None
++    if array.shape != (size,):
++        return None
++    if not np.isfinite(array).all():
++        return None
++    return array
++
++
++def _outside_direction(target: np.ndarray, reference: np.ndarray) -> str | None:
++    for index, (lower, upper) in enumerate(DEPLOYMENT_SOFT_LIMITS):
++        if reference[index] < lower and target[index] < reference[index] - 1e-9:
++            return f"J{index + 1}_FURTHER_OUTSIDE_LOW"
++        if reference[index] > upper and target[index] > reference[index] + 1e-9:
++            return f"J{index + 1}_FURTHER_OUTSIDE_HIGH"
++    return None
++
++
++def validate_raw_target(raw_target_7, reference_7) -> tuple[bool, str | None]:
++    """Validate an absolute policy target against the accepted-target reference."""
++
++    target = _vector(raw_target_7, TARGET_DIM)
++    reference = _vector(reference_7, TARGET_DIM)
++    if target is None:
++        try:
++            shape = np.asarray(raw_target_7).shape
++        except (TypeError, ValueError):
++            shape = None
++        return (False, "TARGET_SHAPE" if shape != (TARGET_DIM,) else "NONFINITE_TARGET")
++    if reference is None:
++        try:
++            shape = np.asarray(reference_7).shape
++        except (TypeError, ValueError):
++            shape = None
++        return (False, "REFERENCE_SHAPE" if shape != (TARGET_DIM,) else "NONFINITE_REFERENCE")
++    if np.any(target[:ARM_DIM] < PHYSICAL_HARD_LIMITS[:, 0]) or np.any(target[:ARM_DIM] > PHYSICAL_HARD_LIMITS[:, 1]):
++        return False, "HARD_LIMIT"
++    if not GRIPPER_LIMITS_M[0] <= target[6] <= GRIPPER_LIMITS_M[1]:
++        return False, "GRIPPER_LIMIT"
++    direction_reason = _outside_direction(target, reference)
++    if direction_reason is not None:
++        return False, direction_reason
++    if np.max(np.abs(target[:ARM_DIM] - reference[:ARM_DIM])) > RAW_CONTINUITY_DEG:
++        return False, "RAW_CONTINUITY"
++    return True, None
++
++
++def validate_executor_command(q_next_6, previous_q_6, dt, driver_speed_cap_deg_s) -> tuple[bool, str | None]:
++    """Validate one absolute six-joint command before it is handed off."""
++
++    q_next = _vector(q_next_6, ARM_DIM)
++    previous = _vector(previous_q_6, ARM_DIM)
++    if q_next is None:
++        try:
++            shape = np.asarray(q_next_6).shape
++        except (TypeError, ValueError):
++            shape = None
++        return (False, "COMMAND_SHAPE" if shape != (ARM_DIM,) else "NONFINITE_COMMAND")
++    if previous is None:
++        try:
++            shape = np.asarray(previous_q_6).shape
++        except (TypeError, ValueError):
++            shape = None
++        return (False, "PREVIOUS_SHAPE" if shape != (ARM_DIM,) else "NONFINITE_PREVIOUS")
++    try:
++        dt = float(dt)
++        speed_cap = float(driver_speed_cap_deg_s)
++    except (TypeError, ValueError):
++        return False, "BAD_TIMING"
++    if not np.isfinite(dt) or dt <= 0.0 or not np.isfinite(speed_cap) or speed_cap <= 0.0:
++        return False, "BAD_TIMING"
++    if np.any(q_next < PHYSICAL_HARD_LIMITS[:, 0]) or np.any(q_next > PHYSICAL_HARD_LIMITS[:, 1]):
++        return False, "HARD_LIMIT"
++    direction_reason = _outside_direction(q_next, previous)
++    if direction_reason is not None:
++        return False, direction_reason
++    delta = np.abs(q_next - previous)
++    if np.max(delta) > EXECUTOR_STEP_DEG + 1e-9:
++        return False, "EXECUTOR_STEP"
++    if np.max(delta / dt) > speed_cap + 1e-9:
++        return False, "DRIVER_SPEED_CAP"
++    return True, None
++
++
++class PhaseAwareExecutor:
++    """Acceleration-limited, braking-aware six-joint 50 Hz command generator."""
++
++    def __init__(self, control_hz: float = 50.0, ramp_sec: float = 0.50) -> None:
++        if not np.isfinite(control_hz) or control_hz <= 0.0:
++            raise ValueError("control_hz must be positive")
++        if not np.isfinite(ramp_sec) or ramp_sec <= 0.0:
++            raise ValueError("ramp_sec must be positive")
++        self.dt = 1.0 / float(control_hz)
++        self.ramp_sec = float(ramp_sec)
++        self.v_cmd = np.zeros(ARM_DIM, dtype=np.float64)
++
++    def step(self, commanded_6, target_6, phase: str = "NORMAL", wrist_scale: float = 1.0) -> np.ndarray:
++        if phase != "NORMAL":
++            raise ValueError("unsupported phase; only NORMAL is implemented")
++        commanded = _vector(commanded_6, ARM_DIM)
++        target = _vector(target_6, ARM_DIM)
++        if commanded is None or target is None:
++            raise ValueError("commanded_6 and target_6 must be finite shape (6,)")
++        if not np.isfinite(wrist_scale) or wrist_scale < 0.0:
++            raise ValueError("wrist_scale must be nonnegative")
++        vmax = PHASE_VMAX_DEG_S.copy()
++        vmax[3:] *= float(wrist_scale)
++        amax = vmax / self.ramp_sec
++        error = target - commanded
++        absolute_error = np.abs(error)
++        acceleration_tick = amax * self.dt
++        stopping_velocity = np.sqrt(acceleration_tick**2 + 2.0 * amax * absolute_error) - acceleration_tick
++        desired_velocity = np.sign(error) * np.minimum(vmax, stopping_velocity)
++        self.v_cmd += np.clip(desired_velocity - self.v_cmd, -acceleration_tick, acceleration_tick)
++        return commanded + np.clip(self.v_cmd * self.dt, -EXECUTOR_STEP_DEG, EXECUTOR_STEP_DEG)
++
++
++def gripper_send_decision(target_m, last_sent_m, last_sent_ts, now) -> tuple[bool, bool]:
++    """Return whether a gripper target is material or its keepalive is due."""
++
++    target = float(target_m)
++    if not np.isfinite(target):
++        raise ValueError("target_m must be finite")
++    changed = last_sent_m is None or abs(target - float(last_sent_m)) >= GRIPPER_CHANGE_M
++    keepalive = last_sent_ts is not None and float(now) - float(last_sent_ts) >= GRIPPER_KEEPALIVE_S
++    return bool(changed or keepalive), bool(keepalive)
+--- a/scripts/pi05_joint2999_rollout.py
 +++ b/scripts/pi05_joint2999_rollout.py
 @@ -0,0 +1,1628 @@
 +"""Guarded Direct Joint2999 rollout with a read-only dry-run default."""
@@ -1651,1297 +1837,7 @@ index 0000000..e668677
 +
 +if __name__ == "__main__":
 +    raise SystemExit(main())
-diff --git a/scripts/test_pi05_joint2999_rollout.py b/scripts/test_pi05_joint2999_rollout.py
-new file mode 100644
-index 0000000..dc203d3
---- /dev/null
-+++ b/scripts/test_pi05_joint2999_rollout.py
-@@ -0,0 +1,1009 @@
-+from __future__ import annotations
-+
-+import argparse
-+import json
-+from pathlib import Path
-+import threading
-+import time
-+
-+import numpy as np
-+import pytest
-+
-+import scripts.pi05_joint2999_rollout as rollout
-+from scripts.pi05_joint2999_rollout import REAL_ACKNOWLEDGEMENT
-+from scripts.pi05_joint2999_rollout import build_joint_observation
-+from scripts.pi05_joint2999_rollout import parse_args
-+from scripts.pi05_joint2999_rollout import run_dry_run
-+from scripts.pi05_joint2999_rollout import run_preflight
-+from scripts.pi05_joint2999_rollout import run_real
-+
-+
-+class FakeClock:
-+    def __init__(self) -> None:
-+        self.now = 100.0
-+
-+    def monotonic(self) -> float:
-+        return self.now
-+
-+    def sleep(self, seconds: float) -> None:
-+        self.now += seconds
-+        time.sleep(0)
-+
-+    def advance(self, seconds: float) -> None:
-+        self.now += seconds
-+
-+
-+class CommandSinkThatMustNotSend:
-+    def __init__(self) -> None:
-+        self.previews: list[dict] = []
-+
-+    def preview(self, command: dict) -> None:
-+        self.previews.append(command)
-+
-+    def send_arm_absolute(self, *_args, **_kwargs) -> None:
-+        raise AssertionError("dry-run must not write arm commands")
-+
-+    def send_gripper(self, *_args, **_kwargs) -> None:
-+        raise AssertionError("dry-run must not write gripper commands")
-+
-+    def hold_stop(self, *_args, **_kwargs) -> None:
-+        raise AssertionError("dry-run must not write hold/stop commands")
-+
-+    def enable(self) -> None:
-+        raise AssertionError("dry-run must not enable the arm")
-+
-+
-+class RecordingWriteAdapter:
-+    explicit_real_write_adapter = True
-+
-+    def __init__(self, event_log=None) -> None:
-+        self.event_log = event_log
-+        self.enable_count = 0
-+        self.arm_commands: list[np.ndarray] = []
-+        self.gripper_commands: list[float] = []
-+        self.stop_reasons: list[str] = []
-+        self.successful_can_write_count = 0
-+
-+    def ready(self) -> bool:
-+        return True
-+
-+    def enable(self) -> None:
-+        if self.event_log is not None:
-+            self.event_log.append("enable")
-+        self.enable_count += 1
-+        self.successful_can_write_count += 2
-+
-+    def send_arm_absolute(self, command) -> None:
-+        if self.event_log is not None:
-+            self.event_log.append("send_arm_absolute")
-+        self.arm_commands.append(np.asarray(command).copy())
-+        self.successful_can_write_count += 3
-+
-+    def send_gripper(self, target_m: float) -> None:
-+        if self.event_log is not None:
-+            self.event_log.append("send_gripper")
-+        self.gripper_commands.append(float(target_m))
-+        self.successful_can_write_count += 1
-+
-+    def hold_stop(self, reason: str) -> None:
-+        if self.event_log is not None:
-+            self.event_log.append("hold_stop")
-+        self.stop_reasons.append(reason)
-+        self.successful_can_write_count += 1
-+
-+
-+class PartialEnableWriteAdapter(RecordingWriteAdapter):
-+    def enable(self) -> None:
-+        self.enable_count += 1
-+        self.successful_can_write_count += 1
-+        raise RuntimeError("second enable CAN frame failed")
-+
-+
-+class PartialArmWriteAdapter(RecordingWriteAdapter):
-+    def send_arm_absolute(self, command) -> None:
-+        self.successful_can_write_count += 1
-+        raise RuntimeError("second arm CAN frame failed")
-+
-+
-+class DeadlineJumpingPreviewSink(CommandSinkThatMustNotSend):
-+    def __init__(self, clock: FakeClock) -> None:
-+        super().__init__()
-+        self.clock = clock
-+        self.preview_timestamps: list[float] = []
-+
-+    def preview(self, command: dict) -> None:
-+        super().preview(command)
-+        self.preview_timestamps.append(self.clock.now)
-+        if len(self.preview_timestamps) == 1:
-+            self.clock.advance(3.5 * rollout.CONTROL_DT)
-+
-+
-+class FakeRuntimeDependencies:
-+    """Read-only camera, feedback, and policy boundary with deterministic time."""
-+
-+    def __init__(
-+        self,
-+        *,
-+        frame_keys=(1,),
-+        inference_delay=0.0,
-+        action=None,
-+        driver_statuses=None,
-+        event_log=None,
-+        fault_after_feedback_reads=None,
-+    ) -> None:
-+        self.clock = FakeClock()
-+        self.command_sink = CommandSinkThatMustNotSend()
-+        self.frame_keys = list(frame_keys)
-+        self.inference_delay = inference_delay
-+        self.action = np.zeros(7, dtype=np.float32) if action is None else np.asarray(action, dtype=np.float32)
-+        self.driver_statuses = list(driver_statuses or [])
-+        self.event_log = event_log
-+        self.fault_after_feedback_reads = fault_after_feedback_reads
-+        self.camera_probe_count = 0
-+        self.feedback_probe_count = 0
-+        self.camera_read_count = 0
-+        self.feedback_read_count = 0
-+        self.infer_count = 0
-+        self._frame_timestamps: dict[object, float] = {}
-+
-+    def monotonic(self) -> float:
-+        return self.clock.monotonic()
-+
-+    def sleep(self, seconds: float) -> None:
-+        self.clock.sleep(seconds)
-+
-+    def read_camera_pair(self):
-+        if self.event_log is not None:
-+            self.event_log.append("read_camera_pair")
-+        index = min(self.camera_read_count, len(self.frame_keys) - 1)
-+        frame_key = self.frame_keys[index]
-+        self.camera_read_count += 1
-+        self._frame_timestamps.setdefault(frame_key, self.clock.now)
-+        return (
-+            np.zeros((480, 640, 3), dtype=np.uint8),
-+            np.ones((480, 640, 3), dtype=np.uint8),
-+            self._frame_timestamps[frame_key],
-+            frame_key,
-+        )
-+
-+    def read_feedback(self):
-+        if self.event_log is not None:
-+            self.event_log.append("read_feedback")
-+        self.feedback_read_count += 1
-+        return np.zeros(7, dtype=np.float64), self.clock.now
-+
-+    def infer(self, _observation):
-+        if self.event_log is not None:
-+            self.event_log.append("infer")
-+        self.infer_count += 1
-+        self.clock.advance(self.inference_delay)
-+        return {"actions": np.tile(self.action, (10, 1))}
-+
-+    def probe_cameras(self, manifest):
-+        self.camera_probe_count += 1
-+        return {
-+            "top": {
-+                "resolved_identity": manifest["top"]["path"],
-+                "actual_shape": {"width": 640, "height": 480, "channels": 3},
-+                "freshness_verifiable": True,
-+                "freshness_age_seconds": 0.01,
-+                "freshness_contract": "bounded_host_receipt_sequence_liveness",
-+                "timestamp_source": "host_receipt_monotonic_not_sensor_capture_time",
-+                "source_capture_timestamp_available": False,
-+                "host_receipt_monotonic_seconds": self.clock.now,
-+                "worker_sequence": 2,
-+                "bounded_buffer_capacity": 1,
-+            },
-+            "wrist": {
-+                "resolved_identity": manifest["wrist"]["serial"],
-+                "actual_shape": {"width": 640, "height": 480, "channels": 3},
-+                "freshness_verifiable": True,
-+                "freshness_age_seconds": 0.01,
-+                "timestamp_source": "realsense_system_time_mapped_to_host_monotonic",
-+                "source_capture_timestamp_available": True,
-+            },
-+        }
-+
-+    def probe_feedback(self):
-+        self.feedback_probe_count += 1
-+        return {
-+            "feedback": np.zeros(7, dtype=np.float64),
-+            "feedback_timestamp": self.clock.now,
-+            "feedback_age_seconds": 0.0,
-+            "driver_status": healthy_driver_status(self.clock.now),
-+        }
-+
-+    def driver_status(self):
-+        if self.event_log is not None:
-+            self.event_log.append("driver_status")
-+        if (
-+            self.fault_after_feedback_reads is not None
-+            and self.feedback_read_count >= self.fault_after_feedback_reads
-+        ):
-+            return faulted_driver_status(self.clock.now)
-+        if self.driver_statuses:
-+            return self.driver_statuses.pop(0)
-+        return healthy_driver_status(self.clock.now)
-+
-+
-+class PostEnableFailureDependencies(FakeRuntimeDependencies):
-+    def read_feedback(self):
-+        if self.feedback_read_count >= 2:
-+            raise RuntimeError("post-enable feedback failed")
-+        return super().read_feedback()
-+
-+
-+class BlockingCameraDependencies(FakeRuntimeDependencies):
-+    def __init__(self) -> None:
-+        super().__init__()
-+        self.camera_blocked = threading.Event()
-+        self.release_camera = threading.Event()
-+        self.camera_returned = threading.Event()
-+        self.close_count = 0
-+
-+    def read_camera_pair(self):
-+        self.camera_blocked.set()
-+        self.release_camera.wait(timeout=2.0)
-+        self.camera_returned.set()
-+        raise RuntimeError("camera read cancelled")
-+
-+    def close(self) -> None:
-+        self.close_count += 1
-+
-+
-+class ThreadCheckedRuntimeDependencies(FakeRuntimeDependencies):
-+    def read_camera_pair(self):
-+        assert threading.current_thread().name == "joint2999-camera-inference"
-+        return super().read_camera_pair()
-+
-+    def infer(self, observation):
-+        assert threading.current_thread().name == "joint2999-camera-inference"
-+        return super().infer(observation)
-+
-+
-+def healthy_driver_status(timestamp: float) -> dict:
-+    return {
-+        "healthy": True,
-+        "timestamp": timestamp,
-+        "arm_status": 0,
-+        "arm_error_code": 0,
-+        "driver_fault_codes": [0, 0, 0, 0, 0, 0],
-+        "gripper_status_code": 0,
-+    }
-+
-+
-+def faulted_driver_status(timestamp: float) -> dict:
-+    status = healthy_driver_status(timestamp)
-+    status.update({"healthy": False, "driver_fault_codes": [0, 0, 32, 0, 0, 0]})
-+    return status
-+
-+
-+def make_args(tmp_path: Path, **overrides) -> argparse.Namespace:
-+    values = {
-+        "dry_run": True,
-+        "real": False,
-+        "manifest": Path("configs/piper_joint2999_camera.yaml"),
-+        "checkpoint": rollout.CHECKPOINT,
-+        "config_name": rollout.CONFIG_NAME,
-+        "prompt": rollout.PROMPT,
-+        "max_time": 0.05,
-+        "output_dir": tmp_path,
-+        "operator_ack": None,
-+        "write_adapter": None,
-+        "can_interface": "can0",
-+    }
-+    values.update(overrides)
-+    return argparse.Namespace(**values)
-+
-+
-+@pytest.fixture
-+def preflight_environment(monkeypatch):
-+    monkeypatch.setenv("OPERATOR_ONSITE", "YES")
-+    monkeypatch.setenv("ESTOP_READY", "YES")
-+    monkeypatch.setenv("WORKSPACE_CLEAR", "YES")
-+
-+
-+def test_observation_is_joint_native_and_has_no_tcp_fields():
-+    """Removing native joint state or adding pose fields must break this contract."""
-+    obs = build_joint_observation(
-+        np.zeros((480, 640, 3), dtype=np.uint8),
-+        np.ones((480, 640, 3), dtype=np.uint8),
-+        np.zeros(6),
-+        0.03,
-+        "pick up the battery and place it into the target location",
-+    )
-+
-+    assert obs["state"].shape == (7,)
-+    assert set(obs) == {"images", "state", "prompt"}
-+    assert not any("tcp" in key.lower() for key in obs)
-+
-+
-+def test_policy_decode_uses_only_n1_actions_zero_as_absolute_joint_target():
-+    """Flattening the horizon or selecting a later row would change the physical target."""
-+    actions = np.array(
-+        [
-+            [1.0, 2.0, -3.0, 4.0, 5.0, 6.0, 0.02],
-+            [11.0, 12.0, -13.0, 14.0, 15.0, 16.0, 0.06],
-+        ],
-+        dtype=np.float32,
-+    )
-+
-+    decoded = rollout._first_action({"actions": actions})
-+
-+    np.testing.assert_array_equal(decoded, actions[0])
-+    assert decoded.shape == (7,)
-+
-+
-+def test_dry_run_runs_bounded_multi_tick_loop_without_any_write(tmp_path):
-+    """Removing the bounded executor loop would reduce three 50 Hz previews to one."""
-+    dependencies = FakeRuntimeDependencies(frame_keys=(1,) * 3)
-+
-+    report = run_dry_run(make_args(tmp_path), dependencies=dependencies)
-+
-+    assert report["REAL_CAN_WRITE"] == "NO"
-+    assert report["ARM_ENABLE_COUNT"] == 0
-+    assert report["COMMAND_SEND_COUNT"] == 0
-+    assert report["REAL_ROBOT_EXECUTED"] == "NO"
-+    assert report["preview_count"] == 3
-+    assert dependencies.feedback_read_count >= 2 * report["preview_count"] + 1
-+    assert (tmp_path / "joint2999_dry_run.jsonl").is_file()
-+
-+
-+def test_missed_50hz_deadline_rebases_without_catch_up_burst(tmp_path):
-+    """Leaving next_tick in the past would dispatch several previews at one timestamp."""
-+    dependencies = FakeRuntimeDependencies(frame_keys=(1,))
-+    sink = DeadlineJumpingPreviewSink(dependencies.clock)
-+    dependencies.command_sink = sink
-+
-+    run_dry_run(make_args(tmp_path, max_time=0.14), dependencies=dependencies)
-+
-+    assert len(sink.preview_timestamps) >= 3
-+    gaps = np.diff(sink.preview_timestamps)
-+    assert np.all(gaps >= rollout.CONTROL_DT - 1e-9), sink.preview_timestamps
-+
-+
-+def test_first_target_wait_allows_cold_inference_longer_than_stale_window():
-+    """Cold first inference gets its bounded startup window, not the runtime stale window."""
-+    assert rollout.FIRST_TARGET_TIMEOUT_SECONDS == 20.0
-+    assert rollout.FIRST_TARGET_TIMEOUT_SECONDS > rollout.STALE_AFTER_SECONDS
-+
-+    mailbox = rollout._InferencePublicationMailbox()
-+    assert mailbox.wait_for_pending(rollout.FIRST_TARGET_TIMEOUT_SECONDS) is False
-+
-+
-+def test_inference_runs_once_per_fresh_camera_snapshot(tmp_path):
-+    """Removing frame identity deduplication would infer three times, not twice."""
-+    dependencies = FakeRuntimeDependencies(frame_keys=(1, 1, 2))
-+
-+    report = run_dry_run(make_args(tmp_path), dependencies=dependencies)
-+
-+    assert dependencies.infer_count == 2
-+    assert report["LATEST_TARGET_GENERATION"] == 2
-+    assert report["preview_count"] == 3
-+
-+
-+def test_executor_loop_never_reads_cameras_or_runs_inference_inline(tmp_path):
-+    """Calling camera or policy code on the executor thread would violate the 50 Hz boundary."""
-+    dependencies = ThreadCheckedRuntimeDependencies(frame_keys=(1, 1, 2))
-+
-+    report = run_dry_run(make_args(tmp_path), dependencies=dependencies)
-+
-+    assert dependencies.camera_read_count > 0
-+    assert dependencies.infer_count > 0
-+    assert report["preview_count"] == 3
-+
-+
-+def test_camera_inference_worker_deduplicates_stable_worker_sequence(tmp_path):
-+    """Reprocessing one worker sequence would run policy inference twice for one pair."""
-+    dependencies = FakeRuntimeDependencies(frame_keys=(7, 7, 8))
-+    feedback_mailbox = rollout._LatestFeedbackMailbox()
-+    publication_mailbox = rollout._InferencePublicationMailbox()
-+    feedback_mailbox.put(np.zeros(7), dependencies.clock.now)
-+    worker = rollout.CameraInferenceWorker(
-+        make_args(tmp_path),
-+        dependencies,
-+        feedback_mailbox,
-+        publication_mailbox,
-+    )
-+
-+    assert worker.process_once() == "PUBLISHED"
-+    first = publication_mailbox.take()
-+    assert first.target is not None
-+    assert first.camera_worker_sequence == 7
-+    assert worker.process_once() == "DUPLICATE"
-+    assert publication_mailbox.take() is None
-+    assert worker.process_once() == "PUBLISHED"
-+    second = publication_mailbox.take()
-+
-+    assert second.target is not None
-+    assert second.camera_worker_sequence == 8
-+    assert dependencies.infer_count == 2
-+
-+
-+@pytest.mark.parametrize(
-+    "camera_pair",
-+    [
-+        (
-+            np.zeros((480, 640, 3), dtype=np.uint8),
-+            np.zeros((480, 640, 3), dtype=np.uint8),
-+            100.0,
-+        ),
-+        (
-+            np.zeros((480, 640, 3), dtype=np.uint8),
-+            np.zeros((480, 640, 3), dtype=np.uint8),
-+            100.0,
-+            100.001,
-+        ),
-+    ],
-+)
-+def test_camera_pair_requires_explicit_stable_worker_sequence(camera_pair):
-+    """Falling back to a receipt timestamp would make dedupe depend on read timing."""
-+    with pytest.raises(ValueError, match="worker/source sequence"):
-+        rollout._unpack_camera_pair(camera_pair)
-+
-+
-+def test_camera_inference_worker_rejects_post_inference_stale_data(tmp_path):
-+    """Publishing a target after slow inference would bypass the post-inference age gate."""
-+    dependencies = FakeRuntimeDependencies(inference_delay=0.6)
-+    feedback_mailbox = rollout._LatestFeedbackMailbox()
-+    publication_mailbox = rollout._InferencePublicationMailbox()
-+    feedback_mailbox.put(np.zeros(7), dependencies.clock.now)
-+    worker = rollout.CameraInferenceWorker(
-+        make_args(tmp_path),
-+        dependencies,
-+        feedback_mailbox,
-+        publication_mailbox,
-+    )
-+
-+    assert worker.process_once() == "REJECTED"
-+    publication = publication_mailbox.take()
-+
-+    assert publication.target is None
-+    assert publication.raw_gate == "SKIPPED"
-+    assert publication.safety_reason == "STALE_DATA_HOLD"
-+    assert publication.inference_latency_seconds == pytest.approx(0.6)
-+
-+
-+def test_stale_after_inference_dispatches_stop_without_normal_send(
-+    tmp_path, preflight_environment
-+):
-+    """Removing the publication-time age check would send after a 0.6 s inference."""
-+    dependencies = FakeRuntimeDependencies(inference_delay=0.6)
-+    adapter = RecordingWriteAdapter()
-+    args = make_args(
-+        tmp_path,
-+        dry_run=False,
-+        real=True,
-+        max_time=1.0,
-+        operator_ack=REAL_ACKNOWLEDGEMENT,
-+    )
-+
-+    report = run_real(args, dependencies, write_adapter=adapter)
-+
-+    assert adapter.arm_commands == []
-+    assert adapter.gripper_commands == []
-+    assert adapter.stop_reasons == ["STALE_DATA_HOLD"]
-+    assert report["COMMAND_SEND_COUNT"] == 0
-+    assert report["STOP_DISPATCH_COUNT"] == 1
-+    assert report["STOP_REASON"] == "STALE_DATA_HOLD"
-+
-+
-+def test_post_inference_feedback_drain_exposes_fault_before_command(
-+    tmp_path, preflight_environment
-+):
-+    """Using pre-inference CAN state would hide a fault that arrives while inference runs."""
-+    dependencies = FakeRuntimeDependencies(fault_after_feedback_reads=4)
-+    adapter = RecordingWriteAdapter()
-+    args = make_args(
-+        tmp_path,
-+        dry_run=False,
-+        real=True,
-+        max_time=0.05,
-+        operator_ack=REAL_ACKNOWLEDGEMENT,
-+    )
-+
-+    report = run_real(
-+        args,
-+        dependencies,
-+        write_adapter=adapter,
-+        preflight_report={"PREFLIGHT": "PASS"},
-+    )
-+
-+    assert dependencies.infer_count == 1
-+    assert dependencies.feedback_read_count >= 4
-+    assert adapter.arm_commands == []
-+    assert adapter.stop_reasons == ["DRIVER_FAULT_HOLD"]
-+    assert report["COMMAND_SEND_COUNT"] == 0
-+
-+
-+def test_final_send_is_immediately_preceded_by_feedback_drain_and_driver_poll(
-+    tmp_path, preflight_environment
-+):
-+    """A cached final gate would leave no feedback drain between inference and send."""
-+    events = []
-+    dependencies = FakeRuntimeDependencies(event_log=events)
-+    adapter = RecordingWriteAdapter(event_log=events)
-+    args = make_args(
-+        tmp_path,
-+        dry_run=False,
-+        real=True,
-+        max_time=0.05,
-+        operator_ack=REAL_ACKNOWLEDGEMENT,
-+    )
-+
-+    run_real(
-+        args,
-+        dependencies,
-+        write_adapter=adapter,
-+        preflight_report={"PREFLIGHT": "PASS"},
-+    )
-+
-+    send_index = events.index("send_arm_absolute")
-+    assert events[send_index - 2 : send_index + 1] == [
-+        "read_feedback",
-+        "driver_status",
-+        "send_arm_absolute",
-+    ]
-+    last_infer = max(index for index, event in enumerate(events[:send_index]) if event == "infer")
-+    assert events[last_infer:send_index].count("read_feedback") >= 2
-+
-+
-+def test_partial_enable_failure_forces_stop_and_counts_successful_can_frames(
-+    tmp_path, preflight_environment
-+):
-+    """A failure after the first enable frame must still stop and report both successful writes."""
-+    dependencies = FakeRuntimeDependencies()
-+    adapter = PartialEnableWriteAdapter()
-+    args = make_args(
-+        tmp_path,
-+        dry_run=False,
-+        real=True,
-+        max_time=0.05,
-+        operator_ack=REAL_ACKNOWLEDGEMENT,
-+    )
-+
-+    report = run_real(
-+        args,
-+        dependencies,
-+        write_adapter=adapter,
-+        preflight_report={"PREFLIGHT": "PASS"},
-+    )
-+
-+    assert adapter.stop_reasons == ["WRITE_FAILURE:ENABLE"]
-+    assert report["ARM_ENABLE_COUNT"] == 0
-+    assert report["COMMAND_SEND_COUNT"] == 0
-+    assert report["STOP_DISPATCH_COUNT"] == 1
-+    assert report["CAN_WRITE_COUNT"] == 2
-+    assert report["REAL_CAN_WRITE"] == "YES"
-+    assert report["REAL_ROBOT_EXECUTED"] == "YES"
-+    assert report["STOP_REASON"] == "WRITE_FAILURE:ENABLE"
-+    assert report["RUN_STATUS"] == "FAIL"
-+
-+
-+def test_partial_arm_write_failure_forces_stop_and_counts_successful_can_frames(
-+    tmp_path, preflight_environment
-+):
-+    """A partially written arm command must not be reported as a completed command."""
-+    dependencies = FakeRuntimeDependencies()
-+    adapter = PartialArmWriteAdapter()
-+    args = make_args(
-+        tmp_path,
-+        dry_run=False,
-+        real=True,
-+        max_time=0.05,
-+        operator_ack=REAL_ACKNOWLEDGEMENT,
-+    )
-+
-+    report = run_real(
-+        args,
-+        dependencies,
-+        write_adapter=adapter,
-+        preflight_report={"PREFLIGHT": "PASS"},
-+    )
-+
-+    assert adapter.stop_reasons == ["WRITE_FAILURE:ARM_COMMAND"]
-+    assert report["ARM_ENABLE_COUNT"] == 1
-+    assert report["COMMAND_SEND_COUNT"] == 0
-+    assert report["STOP_DISPATCH_COUNT"] == 1
-+    assert report["CAN_WRITE_COUNT"] == 4
-+    assert report["REAL_CAN_WRITE"] == "YES"
-+    assert report["REAL_ROBOT_EXECUTED"] == "YES"
-+    assert report["STOP_REASON"] == "WRITE_FAILURE:ARM_COMMAND"
-+    assert report["RUN_STATUS"] == "FAIL"
-+
-+
-+def test_post_enable_exception_reports_successful_frames_and_stop_attempt(
-+    tmp_path, preflight_environment
-+):
-+    """An exception after enable must not erase physical-write evidence or its reason."""
-+    dependencies = PostEnableFailureDependencies()
-+    adapter = RecordingWriteAdapter()
-+    args = make_args(
-+        tmp_path,
-+        dry_run=False,
-+        real=True,
-+        max_time=0.05,
-+        operator_ack=REAL_ACKNOWLEDGEMENT,
-+    )
-+
-+    report = run_real(args, dependencies, write_adapter=adapter)
-+
-+    assert adapter.stop_reasons == ["RUNTIME_EXCEPTION:post-enable feedback failed"]
-+    assert report["STOP_REASON"] == "RUNTIME_EXCEPTION:post-enable feedback failed"
-+    assert report["STOP_ATTEMPT_COUNT"] == 1
-+    assert report["STOP_DISPATCH_COUNT"] == 1
-+    assert report["CAN_WRITE_COUNT"] == 3
-+    assert report["REAL_CAN_WRITE"] == "YES"
-+    assert report["REAL_ROBOT_EXECUTED"] == "YES"
-+    assert report["RUN_STATUS"] == "FAIL"
-+
-+
-+def test_stale_dry_run_tick_previews_executor_deceleration(tmp_path):
-+    """Skipping executor.step on stale data would omit the required HOLD/deceleration preview."""
-+    dependencies = FakeRuntimeDependencies(frame_keys=(1,), action=np.array([4.0, 0, 0, 0, 0, 0, 0]))
-+    args = make_args(tmp_path, max_time=0.55)
-+
-+    run_dry_run(args, dependencies=dependencies)
-+    rows = [json.loads(line) for line in (tmp_path / "joint2999_dry_run.jsonl").read_text().splitlines()]
-+    stale_rows = [row for row in rows if row.get("safety_reason") == "STALE_DATA_HOLD"]
-+
-+    assert stale_rows
-+    assert all(row["send_decision"] == "HOLD_PREVIEW" for row in stale_rows)
-+    assert all("executor_command" in row for row in stale_rows)
-+    assert all("joint_velocities_deg_s" in row for row in stale_rows)
-+
-+
-+def test_every_runtime_log_row_records_raw_gate_result(tmp_path):
-+    """Rows emitted while reusing an accepted target must not omit its raw-gate result."""
-+    dependencies = FakeRuntimeDependencies(frame_keys=(1, 1, 1))
-+
-+    run_dry_run(make_args(tmp_path), dependencies=dependencies)
-+    rows = [json.loads(line) for line in (tmp_path / "joint2999_dry_run.jsonl").read_text().splitlines()]
-+
-+    assert rows
-+    assert all(row.get("raw_gate") in {"PASS", "REJECT", "SKIPPED", "NOT_RUN"} for row in rows)
-+
-+
-+@pytest.mark.parametrize(
-+    ("driver_statuses", "action", "reason"),
-+    [
-+        ([faulted_driver_status(100.0)], np.zeros(7), "DRIVER_FAULT_HOLD"),
-+        ([], np.array([6.0, 0, 0, 0, 0, 0, 0]), "SAFETY_ABORT:RAW_CONTINUITY"),
-+    ],
-+)
-+def test_real_fault_or_reject_stops_without_normal_send(
-+    tmp_path, preflight_environment, driver_statuses, action, reason
-+):
-+    """Removing fault/reject gating would emit a normal absolute command."""
-+    dependencies = FakeRuntimeDependencies(driver_statuses=driver_statuses, action=action)
-+    adapter = RecordingWriteAdapter()
-+    args = make_args(
-+        tmp_path,
-+        dry_run=False,
-+        real=True,
-+        operator_ack=REAL_ACKNOWLEDGEMENT,
-+    )
-+
-+    report = run_real(args, dependencies, write_adapter=adapter)
-+
-+    assert adapter.arm_commands == []
-+    assert adapter.gripper_commands == []
-+    assert adapter.stop_reasons == [reason]
-+    assert report["COMMAND_SEND_COUNT"] == 0
-+    assert report["STOP_DISPATCH_COUNT"] == 1
-+
-+
-+def test_preflight_invokes_camera_feedback_and_driver_health_probes(
-+    tmp_path, preflight_environment
-+):
-+    """Returning after manifest validation would leave both probe counters at zero."""
-+    dependencies = FakeRuntimeDependencies()
-+
-+    report = run_preflight(make_args(tmp_path), dependencies=dependencies)
-+
-+    assert dependencies.camera_probe_count == 1
-+    assert dependencies.feedback_probe_count == 1
-+    assert report["CAMERA_PROBE"] == "PASS"
-+    assert report["CAMERA_TOP"]["resolved_identity"].startswith(str(Path("/dev") / "v4l" / "by-id") + "/")
-+    assert report["CAMERA_TOP"]["actual_shape"] == {"width": 640, "height": 480, "channels": 3}
-+    assert report["CAMERA_TOP"]["freshness_contract"] == "bounded_host_receipt_sequence_liveness"
-+    assert report["CAMERA_TOP"]["timestamp_source"] == "host_receipt_monotonic_not_sensor_capture_time"
-+    assert report["CAMERA_WRIST"]["resolved_identity"] == "<REDACTED>"
-+    assert report["CAMERA_WRIST"]["actual_shape"] == {"width": 640, "height": 480, "channels": 3}
-+    assert report["FEEDBACK_PROBE"] == "PASS"
-+    assert report["PIPER_CONNECTION"] == "READ_ONLY_PASS"
-+    assert report["DRIVER_FAULT"] == "NO"
-+    assert report["DRIVER_STATUS"]["healthy"] is True
-+    assert report["ARM_ENABLE_COUNT"] == 0
-+    assert report["COMMAND_SEND_COUNT"] == 0
-+
-+
-+def test_preflight_fails_closed_without_top_host_sequence_liveness(
-+    tmp_path, preflight_environment
-+):
-+    """Trusting a bare camera PASS would admit an unusable OpenCV freshness probe."""
-+    dependencies = FakeRuntimeDependencies()
-+    valid_probe = dependencies.probe_cameras
-+
-+    def probe_without_liveness(manifest):
-+        report = valid_probe(manifest)
-+        report["top"].update(
-+            {
-+                "freshness_verifiable": False,
-+                "freshness_contract": "unavailable",
-+                "timestamp_source": "unavailable_from_opencv_live_capture",
-+            }
-+        )
-+        return report
-+
-+    dependencies.probe_cameras = probe_without_liveness
-+
-+    with pytest.raises(rollout.PreflightError, match="CAMERA_PROBE") as error:
-+        run_preflight(make_args(tmp_path), dependencies=dependencies)
-+
-+    assert error.value.report["CAMERA_PROBE"] == "FAIL"
-+    assert error.value.report["ARM_ENABLE_COUNT"] == 0
-+    assert error.value.report["COMMAND_SEND_COUNT"] == 0
-+
-+
-+@pytest.mark.parametrize(("camera_name", "identity"), [("top", "/dev/video9"), ("wrist", "wrong")])
-+def test_preflight_fails_closed_on_camera_identity_mismatch(
-+    tmp_path, preflight_environment, camera_name, identity
-+):
-+    """A live frame from an undeclared device must not satisfy identity preflight."""
-+    dependencies = FakeRuntimeDependencies()
-+    valid_probe = dependencies.probe_cameras
-+
-+    def probe_wrong_identity(manifest):
-+        report = valid_probe(manifest)
-+        report[camera_name]["resolved_identity"] = identity
-+        return report
-+
-+    dependencies.probe_cameras = probe_wrong_identity
-+
-+    with pytest.raises(rollout.PreflightError, match="CAMERA_PROBE"):
-+        run_preflight(make_args(tmp_path), dependencies=dependencies)
-+
-+
-+def test_real_mode_requires_distinct_acknowledgement():
-+    """Accepting real mode without the exact acknowledgement is unsafe."""
-+    with pytest.raises(SystemExit, match="I_UNDERSTAND_JOINT2999_REAL_RUN"):
-+        parse_args(["--real"])
-+
-+
-+def test_real_mode_requires_explicit_write_adapter(tmp_path, preflight_environment):
-+    """Falling back to the preview sink in real mode would bypass explicit write selection."""
-+    args = make_args(
-+        tmp_path,
-+        dry_run=False,
-+        real=True,
-+        operator_ack=REAL_ACKNOWLEDGEMENT,
-+    )
-+
-+    with pytest.raises(RuntimeError, match="explicit absolute Joint write adapter"):
-+        run_real(args, FakeRuntimeDependencies(), write_adapter=None)
-+
-+
-+def test_real_mode_requires_per_frame_can_write_accounting(tmp_path, preflight_environment):
-+    """Without an adapter frame counter, a partial write could be reported as zero."""
-+    args = make_args(
-+        tmp_path,
-+        dry_run=False,
-+        real=True,
-+        operator_ack=REAL_ACKNOWLEDGEMENT,
-+    )
-+    adapter = RecordingWriteAdapter()
-+    adapter.successful_can_write_count = None
-+
-+    with pytest.raises(RuntimeError, match="CAN-write accounting"):
-+        run_real(args, FakeRuntimeDependencies(), write_adapter=adapter)
-+
-+    assert adapter.enable_count == 0
-+    assert adapter.stop_reasons == []
-+
-+
-+def test_real_mode_ignores_passing_report_and_builds_writer_after_fresh_preflight(
-+    tmp_path, preflight_environment
-+):
-+    """A caller-supplied PASS must not bypass probes or construct the writer early."""
-+    dependencies = FakeRuntimeDependencies()
-+    adapter = RecordingWriteAdapter()
-+    factory_probe_counts = []
-+    args = make_args(
-+        tmp_path,
-+        dry_run=False,
-+        real=True,
-+        operator_ack=REAL_ACKNOWLEDGEMENT,
-+    )
-+
-+    def build_writer():
-+        factory_probe_counts.append(
-+            (dependencies.camera_probe_count, dependencies.feedback_probe_count)
-+        )
-+        return adapter
-+
-+    report = run_real(
-+        args,
-+        dependencies,
-+        write_adapter_factory=build_writer,
-+        preflight_report={"PREFLIGHT": "PASS"},
-+    )
-+
-+    assert factory_probe_counts == [(1, 1)]
-+    assert report["PREFLIGHT"] == "PASS"
-+
-+
-+def test_real_mode_rejects_supplied_pass_when_fresh_preflight_fails(
-+    tmp_path, preflight_environment
-+):
-+    """Only the fresh report from the actual runtime dependencies may authorize a writer."""
-+    dependencies = FakeRuntimeDependencies()
-+    dependencies.probe_feedback = lambda: (_ for _ in ()).throw(RuntimeError("fresh probe failed"))
-+    writer_built = False
-+    args = make_args(
-+        tmp_path,
-+        dry_run=False,
-+        real=True,
-+        operator_ack=REAL_ACKNOWLEDGEMENT,
-+    )
-+
-+    def build_writer():
-+        nonlocal writer_built
-+        writer_built = True
-+        return RecordingWriteAdapter()
-+
-+    with pytest.raises(rollout.PreflightError, match="fresh probe failed"):
-+        run_real(
-+            args,
-+            dependencies,
-+            write_adapter_factory=build_writer,
-+            preflight_report={"PREFLIGHT": "PASS"},
-+        )
-+
-+    assert dependencies.camera_probe_count == 1
-+    assert writer_built is False
-+
-+
-+def test_wrong_runtime_ack_blocks_preflight_and_adapter(tmp_path, preflight_environment):
-+    """Moving acknowledgement after preflight would touch hardware on an unacknowledged run."""
-+    dependencies = FakeRuntimeDependencies()
-+    adapter = RecordingWriteAdapter()
-+    args = make_args(tmp_path, dry_run=False, real=True, operator_ack="wrong")
-+
-+    with pytest.raises(RuntimeError, match=REAL_ACKNOWLEDGEMENT):
-+        run_real(args, dependencies, write_adapter=adapter)
-+
-+    assert dependencies.camera_probe_count == 0
-+    assert dependencies.feedback_probe_count == 0
-+    assert adapter.enable_count == 0
-+    assert adapter.stop_reasons == []
-+
-+
-+def test_main_builds_deployable_default_readonly_dependencies(monkeypatch, tmp_path):
-+    """Reintroducing the unavailable facade would bypass the concrete default factory."""
-+    args = make_args(tmp_path)
-+    created = []
-+    dependencies = FakeRuntimeDependencies()
-+    policy = object()
-+
-+    monkeypatch.setattr(rollout, "parse_args", lambda _argv=None: args)
-+    monkeypatch.setattr(rollout, "run_preflight", lambda _args, dependencies: {"PREFLIGHT": "PASS"})
-+    monkeypatch.setattr(rollout, "load_joint_policy", lambda *_args: (policy, {"CHECKPOINT_LOAD": "PASS"}))
-+
-+    def build_default(*, policy, manifest_path, can_interface):
-+        created.append((policy, manifest_path, can_interface))
-+        return dependencies
-+
-+    monkeypatch.setattr(rollout, "DefaultRuntimeDependencies", build_default)
-+    monkeypatch.setattr(
-+        rollout,
-+        "run_dry_run",
-+        lambda _args, dependencies: {
-+            "REAL_CAN_WRITE": "NO",
-+            "REAL_ROBOT_EXECUTED": "NO",
-+            "dependencies": dependencies is not None,
-+        },
-+    )
-+
-+    assert rollout.main([]) == 0
-+    assert created == [(policy, args.manifest, "can0")]
-+
-+
-+def test_main_preserves_real_runtime_write_counters(monkeypatch, tmp_path, capsys):
-+    """Merging preflight last would overwrite real runtime writes with zero counters."""
-+    args = make_args(
-+        tmp_path,
-+        dry_run=False,
-+        real=True,
-+        operator_ack=REAL_ACKNOWLEDGEMENT,
-+        write_adapter=rollout.SOCKETCAN_WRITE_ADAPTER,
-+    )
-+    dependencies = FakeRuntimeDependencies()
-+    adapter = RecordingWriteAdapter()
-+
-+    monkeypatch.setattr(rollout, "parse_args", lambda _argv=None: args)
-+    monkeypatch.setattr(rollout, "load_joint_policy", lambda *_args: (object(), {"CHECKPOINT_LOAD": "PASS"}))
-+    monkeypatch.setattr(rollout, "DefaultRuntimeDependencies", lambda **_kwargs: dependencies)
-+    monkeypatch.setattr(
-+        rollout,
-+        "run_preflight",
-+        lambda _args, dependencies: {
-+            "PREFLIGHT": "PASS",
-+            "REAL_CAN_WRITE": "NO",
-+            "ARM_ENABLE_COUNT": 0,
-+            "COMMAND_SEND_COUNT": 0,
-+        },
-+    )
-+    monkeypatch.setattr(rollout, "_build_explicit_write_adapter", lambda _args: adapter)
-+    monkeypatch.setattr(
-+        rollout,
-+        "run_real",
-+        lambda *_args, **_kwargs: {
-+            "REAL_CAN_WRITE": "YES",
-+            "REAL_ROBOT_EXECUTED": "YES",
-+            "ARM_ENABLE_COUNT": 1,
-+            "COMMAND_SEND_COUNT": 2,
-+        },
-+    )
-+
-+    assert rollout.main([]) == 0
-+    report = json.loads(capsys.readouterr().out)
-+    assert report["REAL_CAN_WRITE"] == "YES"
-+    assert report["ARM_ENABLE_COUNT"] == 1
-+    assert report["COMMAND_SEND_COUNT"] == 2
-+
-+
-+def test_main_does_not_close_dependencies_while_camera_worker_is_blocked(
-+    monkeypatch, tmp_path, capsys, preflight_environment
-+):
-+    """Closing camera/CAN dependencies under a live worker creates a use-after-close race."""
-+    args = make_args(tmp_path, max_time=0.03)
-+    dependencies = BlockingCameraDependencies()
-+
-+    monkeypatch.setattr(rollout, "STALE_AFTER_SECONDS", 0.01)
-+    monkeypatch.setattr(rollout, "parse_args", lambda _argv=None: args)
-+    monkeypatch.setattr(
-+        rollout,
-+        "load_joint_policy",
-+        lambda *_args: (object(), {"CHECKPOINT_LOAD": "PASS"}),
-+    )
-+    monkeypatch.setattr(rollout, "DefaultRuntimeDependencies", lambda **_kwargs: dependencies)
-+
-+    try:
-+        assert rollout.main([]) == 1
-+        report = json.loads(capsys.readouterr().out)
-+        assert dependencies.camera_blocked.is_set()
-+        assert report["CAMERA_INFERENCE_WORKER_STOPPED"] == "NO"
-+        assert report["RUN_STATUS"] == "FAIL"
-+        assert report["STOP_REASON"] == "CAMERA_INFERENCE_WORKER_STOP_TIMEOUT"
-+        assert dependencies.close_count == 0
-+    finally:
-+        dependencies.release_camera.set()
-+        assert dependencies.camera_returned.wait(timeout=1.0)
-+
-+
-+def test_quality58_h20_final_checkpoint_runner_contract():
-+    """The runner defaults must match the final Quality58 H20 deployment artifact."""
-+    from openpi.rollouts import direct_joint_core
-+    from openpi.training import config as training_config
-+
-+    expected_checkpoint = Path(
-+        "<CHECKPOINT_ROOT>/"
-+        "pi05_piper_joint_rtc_h20_quality58_finetune/"
-+        "pi05_piper_joint_rtc_h20_quality58_3k_20260902_135854/2999"
-+    )
-+
-+    assert rollout.CONFIG_NAME == "pi05_piper_joint_rtc_h20_quality58_finetune"
-+    assert rollout.CHECKPOINT == expected_checkpoint
-+
-+    config = training_config.get_config(rollout.CONFIG_NAME)
-+    assert config.model.action_horizon == 20
-+    assert config.model.action_dim == 32
-+    assert config.data.create(config.assets_dirs, config.model).action_sequence_keys == ("action",)
-+
-+    norm_path = expected_checkpoint / "assets" / "local/piper_joint_rtc_quality58" / "norm_stats.json"
-+    assert norm_path.is_file()  # checkpoint-local norm was validated by the prior offline gate
-+    assert rollout._first_action({"actions": np.zeros((20, 7), dtype=np.float32)}).shape == (7,)
-+
-+    assert np.array_equal(direct_joint_core.PHYSICAL_HARD_LIMITS[2], np.array([-170.0, 0.0]))
-+    assert direct_joint_core.EXECUTOR_STEP_DEG == 1.0
-diff --git a/scripts/test_verify_piper_joint2999_cameras.py b/scripts/test_verify_piper_joint2999_cameras.py
-new file mode 100644
-index 0000000..638f473
---- /dev/null
-+++ b/scripts/test_verify_piper_joint2999_cameras.py
-@@ -0,0 +1,266 @@
-+from __future__ import annotations
-+
-+from pathlib import Path
-+import sys
-+import threading
-+import time
-+from types import SimpleNamespace
-+
-+import numpy as np
-+import pytest
-+
-+import scripts.verify_piper_joint2999_cameras as camera_probe
-+from scripts.verify_piper_joint2999_cameras import FRAME_STALE_AFTER_SECONDS
-+from scripts.verify_piper_joint2999_cameras import FreshnessUnverifiableError
-+from scripts.verify_piper_joint2999_cameras import _bounded_host_receipt_sequence
-+from scripts.verify_piper_joint2999_cameras import _frame_report
-+from scripts.verify_piper_joint2999_cameras import _probe_top
-+from scripts.verify_piper_joint2999_cameras import _probe_wrist
-+from scripts.verify_piper_joint2999_cameras import load_camera_manifest
-+from scripts.verify_piper_joint2999_cameras import probe_cameras
-+from scripts.verify_piper_joint2999_cameras import verify_manifest_shape
-+
-+
-+VALID_TOP = {
-+    "kind": "opencv",
-+    "path": "<TOP_CAMERA_DEVICE_PATH>",
-+    "fourcc": "MJPG",
-+    "width": 640,
-+    "height": 480,
-+    "fps": 30,
-+}
-+VALID_WRIST = {
-+    "kind": "intelrealsense",
-+    "serial": "<REDACTED>",
-+    "width": 640,
-+    "height": 480,
-+    "fps": 30,
-+}
-+
-+
-+def test_manifest_declares_stable_top_and_current_wrist_identity():
-+    manifest = load_camera_manifest(Path("configs/piper_joint2999_camera.yaml"))
-+    verify_manifest_shape(manifest)
-+    assert manifest["top"]["path"].endswith("video-index0")
-+    assert manifest["top"]["fourcc"] == "MJPG"
-+    assert manifest["wrist"]["serial"] == "<REDACTED>"
-+
-+
-+def test_manifest_rejects_stale_wrist_serial():
-+    with pytest.raises(ValueError, match="<REDACTED>"):
-+        verify_manifest_shape({"top": VALID_TOP, "wrist": {**VALID_WRIST, "serial": "<REDACTED>"}})
-+
-+
-+def test_frame_report_rejects_old_monotonic_source_timestamp():
-+    old_source_timestamp = time.monotonic() - FRAME_STALE_AFTER_SECONDS - 0.1
-+
-+    with pytest.raises(RuntimeError, match="camera frame is stale"):
-+        _frame_report(
-+            np.zeros((480, 640, 3), dtype=np.uint8),
-+            source_timestamp_monotonic=old_source_timestamp,
-+            source_timestamp_kind="injected-test-source",
-+        )
-+
-+
-+@pytest.mark.parametrize("source_timestamp", [float("nan"), float("inf"), float("-inf")])
-+def test_frame_report_marks_nonfinite_source_timestamp_unverifiable(source_timestamp):
-+    report = _frame_report(
-+        np.zeros((480, 640, 3), dtype=np.uint8),
-+        source_timestamp_monotonic=source_timestamp,
-+        source_timestamp_kind="injected-test-source",
-+    )
-+
-+    assert report["freshness_verifiable"] is False
-+    assert report["freshness_age_seconds"] is None
-+
-+
-+class FakeCapture:
-+    def __init__(self, frame):
-+        self.frame = frame
-+        self.released = False
-+        self.settings = []
-+
-+    def isOpened(self):
-+        return True
-+
-+    def set(self, property_id, value):
-+        self.settings.append((property_id, value))
-+
-+    def read(self):
-+        return True, self.frame
-+
-+    def release(self):
-+        self.released = True
-+
-+
-+def _install_fake_cv2(monkeypatch, capture):
-+    fake_cv2 = SimpleNamespace(
-+        CAP_PROP_FOURCC=1,
-+        CAP_PROP_FRAME_WIDTH=2,
-+        CAP_PROP_FRAME_HEIGHT=3,
-+        CAP_PROP_FPS=4,
-+        VideoCapture=lambda path: capture,
-+        VideoWriter_fourcc=lambda *fourcc: 99,
-+    )
-+    monkeypatch.setitem(sys.modules, "cv2", fake_cv2)
-+    monkeypatch.setattr(camera_probe.Path, "exists", lambda path: True)
-+
-+
-+def test_probe_top_establishes_bounded_host_receipt_sequence_liveness(monkeypatch):
-+    capture = FakeCapture(np.zeros((480, 640, 3), dtype=np.uint8))
-+    _install_fake_cv2(monkeypatch, capture)
-+
-+    report = _probe_top(VALID_TOP, read_frames=True)
-+
-+    assert report["resolved_identity"] == VALID_TOP["path"]
-+    assert report["actual_shape"] == {"width": 640, "height": 480, "channels": 3}
-+    assert report["freshness_verifiable"] is True
-+    assert report["freshness_contract"] == "bounded_host_receipt_sequence_liveness"
-+    assert report["timestamp_source"] == "host_receipt_monotonic_not_sensor_capture_time"
-+    assert report["source_capture_timestamp_available"] is False
-+    assert report["bounded_buffer_capacity"] == 1
-+    assert report["worker_sequence"] >= 2
-+    assert report["freshness_age_seconds"] <= FRAME_STALE_AFTER_SECONDS
-+    assert "frame_timestamp_monotonic_seconds" not in report
-+    assert capture.released
-+
-+
-+def test_top_host_receipt_liveness_fails_closed_when_sequence_stalls():
-+    release_second_read = threading.Event()
-+
-+    class CaptureThatStallsAfterOneFrame(FakeCapture):
-+        def __init__(self):
-+            super().__init__(np.zeros((480, 640, 3), dtype=np.uint8))
-+            self.read_count = 0
-+
-+        def read(self):
-+            self.read_count += 1
-+            if self.read_count == 1:
-+                return True, self.frame
-+            release_second_read.wait(0.1)
-+            return True, self.frame
-+
-+    capture = CaptureThatStallsAfterOneFrame()
-+    try:
-+        with pytest.raises(FreshnessUnverifiableError) as error:
-+            _bounded_host_receipt_sequence(capture, timeout_seconds=0.005)
-+    finally:
-+        release_second_read.set()
-+
-+    assert error.value.report["freshness_verifiable"] is False
-+    assert error.value.report["timestamp_source"] == "host_receipt_monotonic_not_sensor_capture_time"
-+    assert error.value.report["source_capture_timestamp_available"] is False
-+
-+
-+def test_probe_top_releases_capture_when_frame_shape_is_wrong(monkeypatch):
-+    capture = FakeCapture(np.zeros((240, 320, 3), dtype=np.uint8))
-+    _install_fake_cv2(monkeypatch, capture)
-+
-+    with pytest.raises(RuntimeError, match="top frame shape 320x240"):
-+        _probe_top(VALID_TOP, read_frames=True)
-+
-+    assert capture.released
-+
-+
-+class FakeColorFrame:
-+    def __init__(self, frame, timestamp_ms, timestamp_domain):
-+        self.frame = frame
-+        self.timestamp_ms = timestamp_ms
-+        self.timestamp_domain = timestamp_domain
-+
-+    def get_data(self):
-+        return self.frame
-+
-+    def get_timestamp(self):
-+        return self.timestamp_ms
-+
-+    def get_frame_timestamp_domain(self):
-+        return self.timestamp_domain
-+
-+
-+def _install_fake_realsense(monkeypatch, color_frame):
-+    system_time = object()
-+    global_time = object()
-+
-+    class FakePipeline:
-+        def __init__(self):
-+            self.started = False
-+            self.stopped = False
-+
-+        def start(self, config):
-+            self.started = True
-+
-+        def wait_for_frames(self, timeout_ms):
-+            return SimpleNamespace(get_color_frame=lambda: color_frame)
-+
-+        def stop(self):
-+            self.stopped = True
-+
-+    pipeline = FakePipeline()
-+    fake_rs = SimpleNamespace(
-+        camera_info=SimpleNamespace(serial_number=object()),
-+        stream=SimpleNamespace(color=object()),
-+        format=SimpleNamespace(bgr8=object()),
-+        timestamp_domain=SimpleNamespace(system_time=system_time, global_time=global_time),
-+        context=lambda: SimpleNamespace(
-+            query_devices=lambda: [SimpleNamespace(get_info=lambda info: VALID_WRIST["serial"])]
-+        ),
-+        pipeline=lambda context: pipeline,
-+        config=lambda: SimpleNamespace(enable_device=lambda serial: None, enable_stream=lambda *args: None),
-+    )
-+    monkeypatch.setitem(sys.modules, "pyrealsense2", fake_rs)
-+    return pipeline, system_time, global_time
-+
-+
-+def test_probe_wrist_rejects_stale_system_timestamp_and_stops_pipeline(monkeypatch):
-+    timestamp_domain = object()
-+    color_frame = FakeColorFrame(
-+        np.zeros((480, 640, 3), dtype=np.uint8),
-+        (time.time() - FRAME_STALE_AFTER_SECONDS - 0.1) * 1000,
-+        timestamp_domain,
-+    )
-+    pipeline, system_time, _ = _install_fake_realsense(monkeypatch, color_frame)
-+    color_frame.timestamp_domain = system_time
-+
-+    with pytest.raises(RuntimeError, match="camera frame is stale"):
-+        _probe_wrist(VALID_WRIST, read_frames=True)
-+
-+    assert pipeline.stopped
-+
-+
-+def test_probe_wrist_stops_pipeline_when_frame_shape_is_wrong(monkeypatch):
-+    color_frame = FakeColorFrame(np.zeros((240, 320, 3), dtype=np.uint8), time.time() * 1000, None)
-+    pipeline, system_time, _ = _install_fake_realsense(monkeypatch, color_frame)
-+    color_frame.timestamp_domain = system_time
-+
-+    with pytest.raises(RuntimeError, match="wrist frame shape 320x240"):
-+        _probe_wrist(VALID_WRIST, read_frames=True)
-+
-+    assert pipeline.stopped
-+
-+
-+def test_probe_wrist_accepts_global_time_with_bounded_host_receipt(monkeypatch):
-+    color_frame = FakeColorFrame(
-+        np.zeros((480, 640, 3), dtype=np.uint8),
-+        time.time() * 1000,
-+        object(),
-+    )
-+    pipeline, _, global_time = _install_fake_realsense(monkeypatch, color_frame)
-+    color_frame.timestamp_domain = global_time
-+
-+    report = _probe_wrist(VALID_WRIST, read_frames=True)
-+
-+    assert report["freshness_verifiable"] is True
-+    assert report["freshness_contract"] == "bounded_host_receipt_sequence_liveness"
-+    assert report["timestamp_source"] == "host_receipt_monotonic_not_sensor_capture_time"
-+    assert report["source_capture_timestamp_available"] is False
-+    assert pipeline.stopped
-+
-+
-+def test_probe_cameras_combines_backend_reports(monkeypatch):
-+    top_report = {"resolved_identity": "top", "freshness_verifiable": True}
-+    wrist_report = {"resolved_identity": "wrist", "freshness_verifiable": True}
-+    monkeypatch.setattr(camera_probe, "_probe_top", lambda camera, read_frames: top_report)
-+    monkeypatch.setattr(camera_probe, "_probe_wrist", lambda camera, read_frames: wrist_report)
-+
-+    assert probe_cameras({"top": VALID_TOP, "wrist": VALID_WRIST}) == {"top": top_report, "wrist": wrist_report}
-diff --git a/scripts/verify_piper_joint2999_cameras.py b/scripts/verify_piper_joint2999_cameras.py
-new file mode 100644
-index 0000000..8dd03af
---- /dev/null
+--- a/scripts/verify_piper_joint2999_cameras.py
 +++ b/scripts/verify_piper_joint2999_cameras.py
 @@ -0,0 +1,322 @@
 +"""Read-only camera identity and frame verification for the Joint2999 runner."""
@@ -3266,563 +2162,19 @@ index 0000000..8dd03af
 +
 +if __name__ == "__main__":
 +    raise SystemExit(main())
-diff --git a/src/openpi/models/pi0_config.py b/src/openpi/models/pi0_config.py
-index 584d83f..a720a12 100644
---- a/src/openpi/models/pi0_config.py
-+++ b/src/openpi/models/pi0_config.py
-@@ -32,6 +32,15 @@ class Pi0Config(_model.BaseModelConfig):
-     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
-     discrete_state_input: bool = None  # type: ignore
- 
-+    # Optional training-time RTC conditioning. Disabled by default to preserve
-+    # the existing flow-matching objective for ordinary configs.
-+    training_rtc: bool = False
-+    training_rtc_max_delay: int = 4
-+    # Number of physical action dimensions covered by training-time RTC.
-+    # Latent padding dimensions remain ordinary model inputs and are excluded
-+    # from RTC conditioning/loss.
-+    training_rtc_action_dim: int | None = None
-+
-     pytorch_compile_mode: str | None = "max-autotune"
- 
-     def __post_init__(self):
-diff --git a/src/openpi/rollouts/__init__.py b/src/openpi/rollouts/__init__.py
-new file mode 100644
-index 0000000..1bb3c0e
---- /dev/null
-+++ b/src/openpi/rollouts/__init__.py
-@@ -0,0 +1,2 @@
-+"""Small, dependency-light rollout execution components."""
-+
-diff --git a/src/openpi/rollouts/direct_joint_core.py b/src/openpi/rollouts/direct_joint_core.py
-new file mode 100644
-index 0000000..26233d0
---- /dev/null
-+++ b/src/openpi/rollouts/direct_joint_core.py
-@@ -0,0 +1,203 @@
-+"""Pure safety and execution primitives for absolute seven-value targets."""
-+
-+from __future__ import annotations
-+
-+import threading
-+from dataclasses import dataclass
-+
-+import numpy as np
-+
-+ARM_DIM = 6
-+TARGET_DIM = 7
-+RAW_CONTINUITY_DEG = 5.0
-+EXECUTOR_STEP_DEG = 1.0
-+PHASE_VMAX_DEG_S = np.array([10.0, 12.0, 12.0, 3.0, 3.0, 3.0], dtype=np.float64)
-+PHYSICAL_HARD_LIMITS = np.array(
-+    [(-150.0, 124.22), (0.0, 179.91), (-170.0, 0.0),
-+     (-99.98, 99.98), (-69.90, 69.90), (-120.0, 120.0)],
-+    dtype=np.float64,
-+)
-+DEPLOYMENT_SOFT_LIMITS = np.array(
-+    [(-149.0, 123.22), (1.0, 178.91), (-169.0, -0.30),
-+     (-98.98, 98.98), (-68.90, 68.90), (-119.0, 119.0)],
-+    dtype=np.float64,
-+)
-+GRIPPER_LIMITS_M = (0.0, 0.07)
-+GRIPPER_CHANGE_M = 0.0005
-+GRIPPER_KEEPALIVE_S = 5.0
-+
-+
-+@dataclass(frozen=True)
-+class Target:
-+    """One absolute target in [J1, J2, J3, J4, J5, J6, gripper] order."""
-+
-+    values: np.ndarray
-+    timestamp: float
-+    generation_id: int
-+
-+    def __post_init__(self) -> None:
-+        values = np.asarray(self.values, dtype=np.float64)
-+        if values.shape != (TARGET_DIM,):
-+            raise ValueError("target must have shape (7,)")
-+        snapshot = values.copy()
-+        snapshot.setflags(write=False)
-+        object.__setattr__(self, "values", snapshot)
-+
-+
-+class LatestOnlyTargetMailbox:
-+    """Thread-safe single-slot mailbox with overwrite accounting."""
-+
-+    def __init__(self) -> None:
-+        self._lock = threading.Lock()
-+        self._pending: Target | None = None
-+        self._dropped_count = 0
-+
-+    @property
-+    def dropped_count(self) -> int:
-+        with self._lock:
-+            return self._dropped_count
-+
-+    def put(self, target: Target) -> None:
-+        if not isinstance(target, Target):
-+            raise TypeError("target must be a Target")
-+        with self._lock:
-+            if self._pending is not None:
-+                self._dropped_count += 1
-+            self._pending = target
-+
-+    def take(self) -> Target | None:
-+        with self._lock:
-+            target = self._pending
-+            self._pending = None
-+            return target
-+
-+
-+def _vector(value: object, size: int) -> np.ndarray | None:
-+    try:
-+        array = np.asarray(value, dtype=np.float64)
-+    except (TypeError, ValueError):
-+        return None
-+    if array.shape != (size,):
-+        return None
-+    if not np.isfinite(array).all():
-+        return None
-+    return array
-+
-+
-+def _outside_direction(target: np.ndarray, reference: np.ndarray) -> str | None:
-+    for index, (lower, upper) in enumerate(DEPLOYMENT_SOFT_LIMITS):
-+        if reference[index] < lower and target[index] < reference[index] - 1e-9:
-+            return f"J{index + 1}_FURTHER_OUTSIDE_LOW"
-+        if reference[index] > upper and target[index] > reference[index] + 1e-9:
-+            return f"J{index + 1}_FURTHER_OUTSIDE_HIGH"
-+    return None
-+
-+
-+def validate_raw_target(raw_target_7, reference_7) -> tuple[bool, str | None]:
-+    """Validate an absolute policy target against the accepted-target reference."""
-+
-+    target = _vector(raw_target_7, TARGET_DIM)
-+    reference = _vector(reference_7, TARGET_DIM)
-+    if target is None:
-+        try:
-+            shape = np.asarray(raw_target_7).shape
-+        except (TypeError, ValueError):
-+            shape = None
-+        return (False, "TARGET_SHAPE" if shape != (TARGET_DIM,) else "NONFINITE_TARGET")
-+    if reference is None:
-+        try:
-+            shape = np.asarray(reference_7).shape
-+        except (TypeError, ValueError):
-+            shape = None
-+        return (False, "REFERENCE_SHAPE" if shape != (TARGET_DIM,) else "NONFINITE_REFERENCE")
-+    if np.any(target[:ARM_DIM] < PHYSICAL_HARD_LIMITS[:, 0]) or np.any(target[:ARM_DIM] > PHYSICAL_HARD_LIMITS[:, 1]):
-+        return False, "HARD_LIMIT"
-+    if not GRIPPER_LIMITS_M[0] <= target[6] <= GRIPPER_LIMITS_M[1]:
-+        return False, "GRIPPER_LIMIT"
-+    direction_reason = _outside_direction(target, reference)
-+    if direction_reason is not None:
-+        return False, direction_reason
-+    if np.max(np.abs(target[:ARM_DIM] - reference[:ARM_DIM])) > RAW_CONTINUITY_DEG:
-+        return False, "RAW_CONTINUITY"
-+    return True, None
-+
-+
-+def validate_executor_command(q_next_6, previous_q_6, dt, driver_speed_cap_deg_s) -> tuple[bool, str | None]:
-+    """Validate one absolute six-joint command before it is handed off."""
-+
-+    q_next = _vector(q_next_6, ARM_DIM)
-+    previous = _vector(previous_q_6, ARM_DIM)
-+    if q_next is None:
-+        try:
-+            shape = np.asarray(q_next_6).shape
-+        except (TypeError, ValueError):
-+            shape = None
-+        return (False, "COMMAND_SHAPE" if shape != (ARM_DIM,) else "NONFINITE_COMMAND")
-+    if previous is None:
-+        try:
-+            shape = np.asarray(previous_q_6).shape
-+        except (TypeError, ValueError):
-+            shape = None
-+        return (False, "PREVIOUS_SHAPE" if shape != (ARM_DIM,) else "NONFINITE_PREVIOUS")
-+    try:
-+        dt = float(dt)
-+        speed_cap = float(driver_speed_cap_deg_s)
-+    except (TypeError, ValueError):
-+        return False, "BAD_TIMING"
-+    if not np.isfinite(dt) or dt <= 0.0 or not np.isfinite(speed_cap) or speed_cap <= 0.0:
-+        return False, "BAD_TIMING"
-+    if np.any(q_next < PHYSICAL_HARD_LIMITS[:, 0]) or np.any(q_next > PHYSICAL_HARD_LIMITS[:, 1]):
-+        return False, "HARD_LIMIT"
-+    direction_reason = _outside_direction(q_next, previous)
-+    if direction_reason is not None:
-+        return False, direction_reason
-+    delta = np.abs(q_next - previous)
-+    if np.max(delta) > EXECUTOR_STEP_DEG + 1e-9:
-+        return False, "EXECUTOR_STEP"
-+    if np.max(delta / dt) > speed_cap + 1e-9:
-+        return False, "DRIVER_SPEED_CAP"
-+    return True, None
-+
-+
-+class PhaseAwareExecutor:
-+    """Acceleration-limited, braking-aware six-joint 50 Hz command generator."""
-+
-+    def __init__(self, control_hz: float = 50.0, ramp_sec: float = 0.50) -> None:
-+        if not np.isfinite(control_hz) or control_hz <= 0.0:
-+            raise ValueError("control_hz must be positive")
-+        if not np.isfinite(ramp_sec) or ramp_sec <= 0.0:
-+            raise ValueError("ramp_sec must be positive")
-+        self.dt = 1.0 / float(control_hz)
-+        self.ramp_sec = float(ramp_sec)
-+        self.v_cmd = np.zeros(ARM_DIM, dtype=np.float64)
-+
-+    def step(self, commanded_6, target_6, phase: str = "NORMAL", wrist_scale: float = 1.0) -> np.ndarray:
-+        if phase != "NORMAL":
-+            raise ValueError("unsupported phase; only NORMAL is implemented")
-+        commanded = _vector(commanded_6, ARM_DIM)
-+        target = _vector(target_6, ARM_DIM)
-+        if commanded is None or target is None:
-+            raise ValueError("commanded_6 and target_6 must be finite shape (6,)")
-+        if not np.isfinite(wrist_scale) or wrist_scale < 0.0:
-+            raise ValueError("wrist_scale must be nonnegative")
-+        vmax = PHASE_VMAX_DEG_S.copy()
-+        vmax[3:] *= float(wrist_scale)
-+        amax = vmax / self.ramp_sec
-+        error = target - commanded
-+        absolute_error = np.abs(error)
-+        acceleration_tick = amax * self.dt
-+        stopping_velocity = np.sqrt(acceleration_tick**2 + 2.0 * amax * absolute_error) - acceleration_tick
-+        desired_velocity = np.sign(error) * np.minimum(vmax, stopping_velocity)
-+        self.v_cmd += np.clip(desired_velocity - self.v_cmd, -acceleration_tick, acceleration_tick)
-+        return commanded + np.clip(self.v_cmd * self.dt, -EXECUTOR_STEP_DEG, EXECUTOR_STEP_DEG)
-+
-+
-+def gripper_send_decision(target_m, last_sent_m, last_sent_ts, now) -> tuple[bool, bool]:
-+    """Return whether a gripper target is material or its keepalive is due."""
-+
-+    target = float(target_m)
-+    if not np.isfinite(target):
-+        raise ValueError("target_m must be finite")
-+    changed = last_sent_m is None or abs(target - float(last_sent_m)) >= GRIPPER_CHANGE_M
-+    keepalive = last_sent_ts is not None and float(now) - float(last_sent_ts) >= GRIPPER_KEEPALIVE_S
-+    return bool(changed or keepalive), bool(keepalive)
-diff --git a/src/openpi/rollouts/test_direct_joint_core.py b/src/openpi/rollouts/test_direct_joint_core.py
-new file mode 100644
-index 0000000..1d8579c
---- /dev/null
-+++ b/src/openpi/rollouts/test_direct_joint_core.py
-@@ -0,0 +1,91 @@
-+import numpy as np
-+
-+from openpi.rollouts.direct_joint_core import (
-+    LatestOnlyTargetMailbox,
-+    PhaseAwareExecutor,
-+    Target,
-+    gripper_send_decision,
-+    validate_executor_command,
-+    validate_raw_target,
-+)
-+
-+
-+def test_raw_gate_uses_previous_accepted_target_not_live_feedback():
-+    feedback = np.zeros(7)
-+    first = np.array([4.0, 0, 0, 0, 0, 0, 0.02])
-+    second = np.array([8.5, 0, 0, 0, 0, 0, 0.02])
-+    assert validate_raw_target(first, feedback) == (True, None)
-+    assert validate_raw_target(second, first) == (True, None)
-+    assert validate_raw_target(second, feedback)[0] is False
-+
-+
-+def test_raw_gate_rejects_bad_shape_nonfinite_and_limits():
-+    reference = np.zeros(7)
-+    for target in (np.zeros(6), np.full(7, np.nan), np.array([151, 0, 0, 0, 0, 0, 0.02]), np.array([0, 0, 0, 0, 0, 0, 0.071])):
-+        assert validate_raw_target(target, reference)[0] is False
-+
-+
-+def test_raw_gate_does_not_move_farther_outside_deployment_j2_j3_limits():
-+    assert validate_raw_target(np.array([0, 0, 0, 0, 0, 0, 0.02]), np.array([0, 0.5, 0, 0, 0, 0, 0.02]))[0] is False
-+    assert validate_raw_target(np.array([0, 0, 0.1, 0, 0, 0, 0.02]), np.zeros(7))[0] is False
-+    assert validate_raw_target(np.array([0, 1.5, -0.5, 0, 0, 0, 0.02]), np.zeros(7)) == (True, None)
-+
-+
-+def test_executor_never_exceeds_one_degree_per_tick():
-+    executor = PhaseAwareExecutor(50.0, 0.50)
-+    previous = np.zeros(6)
-+    for _ in range(100):
-+        current = executor.step(previous, np.full(6, 30.0))
-+        assert np.max(np.abs(current - previous)) <= 1.0 + 1e-9
-+        previous = current
-+
-+
-+def test_executor_brakes_without_overshoot():
-+    executor = PhaseAwareExecutor(50.0, 0.50)
-+    current = np.zeros(6)
-+    target = np.full(6, 2.0)
-+    for _ in range(200):
-+        next_command = executor.step(current, target)
-+        assert np.all(next_command <= target + 1e-9)
-+        current = next_command
-+    np.testing.assert_allclose(current, target, atol=1e-9)
-+
-+
-+def test_executor_command_checks_step_and_velocity_cap():
-+    assert validate_executor_command(np.zeros(6), np.zeros(6), 0.02, 50.0) == (True, None)
-+    assert validate_executor_command(np.full(6, 1.01), np.zeros(6), 0.02, 50.0)[0] is False
-+    assert validate_executor_command(np.full(6, 1.0), np.zeros(6), 0.02, 40.0)[0] is False
-+    assert validate_executor_command(np.full(6, np.nan), np.zeros(6), 0.02, 50.0)[0] is False
-+
-+
-+def test_mailbox_overwrites_without_backlog():
-+    mailbox = LatestOnlyTargetMailbox()
-+    mailbox.put(Target(np.zeros(7), 1.0, 1))
-+    mailbox.put(Target(np.ones(7), 2.0, 2))
-+    assert mailbox.take().generation_id == 2
-+    assert mailbox.take() is None
-+    assert mailbox.dropped_count == 1
-+
-+
-+def test_mailbox_target_values_are_frozen_after_insertion():
-+    mailbox = LatestOnlyTargetMailbox()
-+    values = np.zeros(7)
-+    mailbox.put(Target(values, 1.0, 1))
-+    values[0] = 9.0
-+
-+    pending = mailbox.take()
-+    np.testing.assert_array_equal(pending.values, np.zeros(7))
-+    with np.testing.assert_raises(ValueError):
-+        pending.values[0] = 9.0
-+
-+
-+def test_executor_rejects_unsupported_phase():
-+    executor = PhaseAwareExecutor()
-+    with np.testing.assert_raises(ValueError):
-+        executor.step(np.zeros(6), np.zeros(6), phase="PAUSED")
-+
-+
-+def test_gripper_send_decision_uses_change_or_keepalive():
-+    assert gripper_send_decision(0.02, 0.019, 10.0, 10.1) == (True, False)
-+    assert gripper_send_decision(0.0201, 0.02, 10.0, 10.1) == (False, False)
-+    assert gripper_send_decision(0.02, 0.02, 10.0, 15.0) == (True, True)
-diff --git a/src/openpi/training/config.py b/src/openpi/training/config.py
-index 4ca47e1..48bea0a 100644
---- a/src/openpi/training/config.py
-+++ b/src/openpi/training/config.py
-@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
- import openpi.policies.aloha_policy as aloha_policy
- import openpi.policies.droid_policy as droid_policy
- import openpi.policies.libero_policy as libero_policy
-+import openpi.policies.piper_policy as piper_policy
- import openpi.shared.download as _download
- import openpi.shared.normalize as _normalize
- import openpi.training.droid_rlds_dataset as droid_rlds_dataset
-@@ -97,6 +98,16 @@ class DataConfig:
-     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
-     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
- 
-+    # Optional frozen-window dataset inputs. When set, create_torch_dataset uses the
-+    # read-only mask-aware adapter instead of LeRobot's episode sampler. These fields
-+    # are intentionally explicit so ordinary LeRobot configs keep their old path.
-+    mask_aware_manifest_path: str | None = None
-+    mask_aware_mask_path: str | None = None
-+    mask_aware_nominal_root: str | None = None
-+    mask_aware_recovery_root: str | None = None
-+    mask_aware_seed: int | None = None
-+    mask_aware_prompt: str | None = None
-+
- 
- class GroupFactory(Protocol):
-     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
-@@ -278,6 +289,124 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
-         )
- 
- 
-+@dataclasses.dataclass(frozen=True)
-+class LeRobotPiperDataConfig(DataConfigFactory):
-+    """Data transforms for absolute native Piper joint targets."""
-+
-+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
-+        default=_transforms.Group(
-+            inputs=[
-+                _transforms.RepackTransform(
-+                    {
-+                        "images": {
-+                            "top": "observation.images.top",
-+                            "wrist": "observation.images.wrist",
-+                        },
-+                        "state": "observation.state",
-+                        "actions": "action",
-+                        "prompt": "task",
-+                    }
-+                )
-+            ]
-+        )
-+    )
-+    action_sequence_keys: Sequence[str] = ("action",)
-+
-+    @override
-+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-+        delta_action_mask = _transforms.make_bool_mask(6, -1)
-+        data_transforms = _transforms.Group(
-+            inputs=[piper_policy.PiperInputs(), _transforms.DeltaActions(delta_action_mask)],
-+            outputs=[_transforms.AbsoluteActions(delta_action_mask), piper_policy.PiperOutputs()],
-+        )
-+        return dataclasses.replace(
-+            self.create_base_config(assets_dirs, model_config),
-+            repack_transforms=self.repack_transforms,
-+            data_transforms=data_transforms,
-+            model_transforms=ModelTransformFactory()(model_config),
-+            action_sequence_keys=self.action_sequence_keys,
-+        )
-+
-+
-+@dataclasses.dataclass(frozen=True)
-+class LeRobotPiperJointRTCQuality58DataConfig(DataConfigFactory):
-+    """Frozen Quality58 Joint-space H20 data with mask-only window sampling.
-+
-+    The two source trees are read through ``MaskAwareJointRTCDataset``. The
-+    frozen manifest and sample mask are the sole authority for training-window
-+    membership; no LeRobot episode sampler is used for this config.
-+    """
-+
-+    repo_id: str = "local/piper_joint_rtc_quality58"
-+    manifest_path: str = (
-+        "<DATA_QA_ROOT>/joint_rtc_expert_salvage_20260901T161500Z/FINAL_TRAINING_MANIFEST.json"
-+    )
-+    mask_path: str = (
-+        "<DATA_QA_ROOT>/joint_rtc_expert_salvage_20260901T161500Z/FINAL_TRAIN_SAMPLE_MASK.json"
-+    )
-+    nominal_root: str = "<NOMINAL_DATASET_ROOT>"
-+    recovery_root: str = (
-+        "<DATASET_ROOT>/"
-+        "piper_openpi_v21_recovery_v1_reviewed_clean_11ep"
-+    )
-+    seed: int | None = None
-+    default_prompt: str = "pick and place"
-+
-+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
-+        default=_transforms.Group(
-+            inputs=[
-+                _transforms.RepackTransform(
-+                    {
-+                        "images": {
-+                            "top": "observation.images.top",
-+                            "wrist": "observation.images.wrist",
-+                        },
-+                        "state": "observation.state",
-+                        "actions": "action",
-+                        "prompt": "prompt",
-+                    }
-+                )
-+            ]
-+        )
-+    )
-+    action_sequence_keys: Sequence[str] = ("action",)
-+
-+    @override
-+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-+        if model_config.action_horizon != 20:
-+            raise ValueError("Quality58 Joint RTC config requires action_horizon=20")
-+        if model_config.action_dim != 32:
-+            raise ValueError("Quality58 Joint RTC config requires latent action_dim=32")
-+        if model_config.training_rtc_action_dim != 7:
-+            raise ValueError("Quality58 Joint RTC config requires physical training_rtc_action_dim=7")
-+
-+        data_transforms = _transforms.Group(
-+            inputs=[piper_policy.PiperInputs()],
-+            outputs=[piper_policy.PiperOutputs()],
-+        )
-+        # J1-J6 are deltas relative to the current state; G remains absolute.
-+        delta_action_mask = _transforms.make_bool_mask(6, -1)
-+        data_transforms = data_transforms.push(
-+            inputs=[_transforms.DeltaActions(delta_action_mask)],
-+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
-+        )
-+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
-+
-+        return dataclasses.replace(
-+            self.create_base_config(assets_dirs, model_config),
-+            repack_transforms=self.repack_transforms,
-+            data_transforms=data_transforms,
-+            model_transforms=model_transforms,
-+            action_sequence_keys=self.action_sequence_keys,
-+            mask_aware_manifest_path=self.manifest_path,
-+            mask_aware_mask_path=self.mask_path,
-+            mask_aware_nominal_root=self.nominal_root,
-+            mask_aware_recovery_root=self.recovery_root,
-+            mask_aware_seed=self.seed,
-+            mask_aware_prompt=self.default_prompt,
-+        )
-+
-+
- @dataclasses.dataclass(frozen=True)
- class LeRobotLiberoDataConfig(DataConfigFactory):
-     """
-@@ -930,6 +1059,71 @@ _CONFIGS = [
-         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-         num_train_steps=20_000,
-     ),
-+    TrainConfig(
-+        # Frozen Quality58 Joint-space H20 training with training-time RTC.
-+        # This is a separate experiment identity; the legacy 103-episode config
-+        # above is intentionally left unchanged.
-+        name="pi05_piper_joint_rtc_h20_quality58_finetune",
-+        model=pi0_config.Pi0Config(
-+            pi05=True,
-+            action_dim=32,
-+            action_horizon=20,
-+            discrete_state_input=False,
-+            paligemma_variant="gemma_2b_lora",
-+            action_expert_variant="gemma_300m_lora",
-+            training_rtc=True,
-+            training_rtc_max_delay=4,
-+            training_rtc_action_dim=7,
-+        ),
-+        data=LeRobotPiperJointRTCQuality58DataConfig(
-+            assets=AssetsConfig(asset_id="local/piper_joint_rtc_quality58"),
-+        ),
-+        checkpoint_base_dir="<CHECKPOINT_ROOT>",
-+        batch_size=16,
-+        lr_schedule=_optimizer.CosineDecaySchedule(
-+            warmup_steps=100,
-+            peak_lr=1e-5,
-+            decay_steps=3_000,
-+            decay_lr=2e-6,
-+        ),
-+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-+        # Params-only initialization; optimizer/train state starts fresh.
-+        weight_loader=weight_loaders.CheckpointWeightLoader(
-+            "<CHECKPOINT_ROOT>/"
-+            "pi05_piper_joint_recovery_mix_finetune/"
-+            "pi05_piper_joint_recovery_mix_103ep_3k_20260831_133508_fastfinish/"
-+            "2999/params"
-+        ),
-+        num_train_steps=3_000,
-+        freeze_filter=pi0_config.Pi0Config(
-+            pi05=True,
-+            action_dim=32,
-+            action_horizon=20,
-+            discrete_state_input=False,
-+            paligemma_variant="gemma_2b_lora",
-+            action_expert_variant="gemma_300m_lora",
-+            training_rtc=True,
-+            training_rtc_max_delay=4,
-+            training_rtc_action_dim=7,
-+        ).get_freeze_filter(),
-+        ema_decay=None,
-+        wandb_enabled=False,
-+        save_interval=500,
-+        keep_period=500,
-+        log_interval=10,
-+    ),
-+    TrainConfig(
-+        name="pi05_piper_joint_recovery_mix_finetune",
-+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=10),
-+        data=LeRobotPiperDataConfig(
-+            repo_id="local/piper_joint_recovery_mix_103ep",
-+            assets=AssetsConfig(asset_id="local/piper_joint_recovery_mix_103ep"),
-+            base_config=DataConfig(prompt_from_task=True),
-+        ),
-+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-+        num_train_steps=20_000,
-+        batch_size=32,
-+    ),
-     #
-     # Debugging configs.
-     #
+--- a/configs/piper_joint2999_camera.yaml
++++ b/configs/piper_joint2999_camera.yaml
+@@ -0,0 +1,13 @@
++top:
++  kind: opencv
++  path: <TOP_CAMERA_DEVICE_PATH>
++  fourcc: MJPG
++  width: 640
++  height: 480
++  fps: 30
++wrist:
++  kind: intelrealsense
++  serial: "<REDACTED>"
++  width: 640
++  height: 480
++  fps: 30

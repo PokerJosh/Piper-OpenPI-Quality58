@@ -1,0 +1,61 @@
+{
+  "schema": "feetech_zero_calibration_v1",
+  "calibrated_at_utc": "<UTC_TIMESTAMP>",
+  "port_hint": "<LEADER_SERIAL_PORT>",
+  "baudrate": 1000000,
+  "center_ticks": 2047,
+  "servo_count": 7,
+  "all_ok": true,
+  "servos": [
+    {
+      "id": 1,
+      "raw_at_pose_before_calib": "<REDACTED>",
+      "homing_offset": "<REDACTED>",
+      "eeprom_encoded": "<REDACTED>",
+      "present_after_calib": 2047
+    },
+    {
+      "id": 2,
+      "raw_at_pose_before_calib": "<REDACTED>",
+      "homing_offset": "<REDACTED>",
+      "eeprom_encoded": "<REDACTED>",
+      "present_after_calib": 2047
+    },
+    {
+      "id": 3,
+      "raw_at_pose_before_calib": "<REDACTED>",
+      "homing_offset": "<REDACTED>",
+      "eeprom_encoded": "<REDACTED>",
+      "present_after_calib": 2047
+    },
+    {
+      "id": 4,
+      "raw_at_pose_before_calib": "<REDACTED>",
+      "homing_offset": "<REDACTED>",
+      "eeprom_encoded": "<REDACTED>",
+      "present_after_calib": 2047
+    },
+    {
+      "id": 5,
+      "raw_at_pose_before_calib": "<REDACTED>",
+      "homing_offset": "<REDACTED>",
+      "eeprom_encoded": "<REDACTED>",
+      "present_after_calib": 2047
+    },
+    {
+      "id": 6,
+      "raw_at_pose_before_calib": "<REDACTED>",
+      "homing_offset": "<REDACTED>",
+      "eeprom_encoded": "<REDACTED>",
+      "present_after_calib": 2047
+    },
+    {
+      "id": 7,
+      "raw_at_pose_before_calib": "<REDACTED>",
+      "homing_offset": "<REDACTED>",
+      "eeprom_encoded": "<REDACTED>",
+      "present_after_calib": 2047
+    }
+  ],
+  "note": "Example only. Do not treat placeholders as calibration values; generate a private result on the target hardware."
+}

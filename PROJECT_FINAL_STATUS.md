@@ -1,13 +1,8 @@
 # Project Final Status
 
-## Scope
-
-The Piper/OpenPI project is formally archived. No further feature work,
-training, hardware testing, or runtime fixes are part of this repository.
+This project is formally archived. No feature work, training, hardware testing, or runtime fixes are part of this repository.
 
 ## Final real-robot status
-
-The project must not be described as a successful final robot task.
 
 ```text
 PREFLIGHT=PASS
@@ -26,29 +21,31 @@ RUN_STATUS=FAIL
 TASK_COMPLETE=NO
 ```
 
-The checkpoint loaded and the camera/CAN feedback preflight passed. The runner
-entered `REAL_RUN`, but the freshness/stale-data safety gate triggered
-`STALE_DATA_HOLD` before any policy joint command was sent. The policy task was
-therefore not completed.
+Checkpoint loading and camera/CAN feedback preflight passed. The runner entered `REAL_RUN`, but the stale-data safety gate triggered before any policy joint command was sent. The policy task was not completed.
 
-A cold-start JAX inference delay was observed to make the first observation or
-target old. `FIRST_TARGET_TIMEOUT_SECONDS=20.0` existed, while
-`STALE_AFTER_SECONDS=0.50` remained. A later warmup-inference proposal (discard
-warmup output, then refresh camera and CAN state) is explicitly
-`PROPOSED_NOT_IMPLEMENTED`.
+`CAN_WRITE_COUNT=3` records enable/stop control writes at the boundary. It is not a count of policy commands. `COMMAND_SEND_COUNT=0` is the authoritative result for policy action delivery.
+
+## Known runtime behavior
+
+Cold-start JAX inference can make the first observation or target old by the time the runtime freshness check evaluates it. The runner has `FIRST_TARGET_TIMEOUT_SECONDS=20.0`, but retains `STALE_AFTER_SECONDS=0.50` for normal runtime freshness. The proposed sequence below was not implemented:
+
+1. Run a cold-start warmup inference.
+2. Discard the warmup output.
+3. Acquire fresh camera frames.
+4. Acquire fresh Piper feedback.
+5. Enter formal runtime.
+
+Status: `PROPOSED_NOT_IMPLEMENTED`. The archive intentionally preserves the fail-closed behavior and does not claim a successful task.
 
 ## Retained safety design
 
-The archived implementation retains:
+- Physical hard joint limits.
+- Gripper limits.
+- Raw policy-output rejection.
+- Safety abort.
+- Executor re-check.
+- Maximum 1 degree/tick for J1–J6.
+- Stale camera, state, and target checks.
+- Driver fault checks and explicit enable/shutdown boundaries.
 
-- physical hard joint limits;
-- gripper limits;
-- raw policy-output rejection;
-- safety abort;
-- executor re-check;
-- maximum 1 degree per tick for J1–J6;
-- stale camera, state, and target checks.
-
-Offline evaluation observed a positive J3 overshoot tendency. Hard-limit and
-raw-reject checks are consequently retained and must not be removed merely to
-make a rollout proceed.
+Offline evaluation observed a positive J3 overshoot tendency. Hard-limit and raw-reject checks remain required.

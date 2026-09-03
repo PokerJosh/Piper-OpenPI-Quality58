@@ -1,62 +1,73 @@
-# OpenPI π0.5 Piper Direct Joint RTC H20 Quality58
+# Piper from Setup to π0.5 Deployment
 
-This repository is the final, selective archive of the Piper/OpenPI Quality58
-project. It is an archive, not an active development branch.
+This private repository is a historical, selective archive of the complete Piper/OpenPI workflow: hardware preparation, CAN and SDK integration, leader/follower teleoperation, camera setup, demonstration recording, dataset review and conversion, Quality58 RTC H20 training, offline evaluation, guarded Direct Joint deployment, safety design, and the final experiment result.
 
-## Final experiment
+It is an archive, not an active development branch. No production behavior is changed here. No training, real-robot run, CAN operation, or GPU evaluation is performed by archive validation.
 
-- Model: π0.5 Piper Direct Joint RTC H20 Quality58
-- Physical action dimension: 7 (J1–J6 plus gripper)
-- Latent/model action dimension: 32
+## Final Quality58 experiment
+
+- Policy: OpenPI π0.5 Piper Direct Joint RTC H20 Quality58
+- Physical output: 7 values, `[J1, J2, J3, J4, J5, J6, gripper]`
+- Model/latent action width: 32
 - Action horizon: 20
 - Dataset selection: 47 nominal + 11 recovery = 58 episodes
 - Valid H20 windows: 25,336
-- Training: 3,000 steps
-- Final checkpoint logical step: 2,999
-- Checkpoint reference: `pi05_piper_joint_rtc_h20_quality58_3k_20260902_135854/2999`
+- Training: 3,000 steps; logical final checkpoint step: 2,999
+- Checkpoint reference only: `pi05_piper_joint_rtc_h20_quality58_3k_20260902_135854/2999`
 
-The checkpoint, dataset episodes, videos, images, logs, and runtime caches are
-intentionally not included.
+The real dataset, videos, images, raw recordings, CAN dumps, checkpoint weights, caches, and environments are intentionally absent. The examples and templates describe their schemas without containing payloads.
 
-## Contents
+## Workflow map
 
-- `src/openpi/`: Quality58 model/data/policy additions and tests.
-- `src/openpi/rollouts/`: final pure Direct Joint safety core and tests.
-- `scripts/`: final Direct Joint2999 runner, camera manifest verifier, offline
-evaluator, mask/data utilities, and focused tests.
-- `configs/`: sanitized camera configuration example.
-- `examples/`: metadata-only sanitized manifest and sample-mask examples; no
-episode payloads are present.
-- `artifacts/`: the small final normalization statistics JSON and sanitized
-provenance metadata.
-- `patches/`: project-scoped recovery patches, sanitized of local paths and
-hardware identifiers.
-- `docs/`: project plans, design specification, and normalization notes.
-- `provenance/`: source revisions and the explicitly preserved deployment
-snapshot of shared files that differed from the main worktree.
+1. [Overview](docs/00_overview.md)
+2. [Environment setup](docs/01_environment_setup.md)
+3. [CAN and SDK](docs/02_piper_can_sdk.md)
+4. [Calibration](docs/03_calibration.md)
+5. [Teleoperation](docs/04_teleoperation.md)
+6. [Camera setup](docs/05_camera_setup.md)
+7. [Data recording](docs/06_data_recording.md)
+8. [Dataset processing](docs/07_dataset_processing.md)
+9. [π0.5 training](docs/08_pi05_training.md)
+10. [Offline evaluation](docs/09_offline_evaluation.md)
+11. [Direct Joint deployment](docs/10_direct_joint_deployment.md)
+12. [Final real-robot run](docs/11_real_robot_run.md)
+13. [Safety design](docs/12_safety.md)
+14. [Known issues](docs/13_known_issues.md)
+15. [Command reference](docs/COMMAND_REFERENCE.md)
 
-## Reproducibility note
+The source snapshots are organized under `hardware/`, `calibration/`, `teleop/`, `recording/`, `dataset_tools/`, `configs/`, `tests/`, and the existing `src/`, `scripts/`, `artifacts/`, and `patches/` directories.
 
-This is a selective snapshot and therefore requires the upstream OpenPI tree
-for imports and the original compatible Python dependencies:
-`REQUIRES_UPSTREAM_OPENPI_TREE`.
+## Final real-robot result
 
-Before any offline use, replace the placeholders `<OPENPI_ROOT>`,
-`<DEPLOYMENT_ROOT>`, `<CHECKPOINT_ROOT>`, `<DATASET_ROOT>`, and
-`<DATA_QA_ROOT>` with paths in the local environment. The sanitized camera
-configuration also requires a locally supplied device path and camera serial;
-no real hardware identifier is archived here. See `REPRODUCIBILITY.md`.
+The final run was **not successful**:
 
-No command in this archive should be used to enable a robot, write CAN, probe
-cameras, train a model, or run a long GPU evaluation without an independent
-safety review. The archived runner retains its fail-closed gates.
+```text
+PREFLIGHT=PASS
+CAMERA_PROBE=PASS
+FEEDBACK_PROBE=PASS
+CHECKPOINT_LOAD=PASS
+ACTION_DIM=7
+ACTION_HORIZON=20
+MODEL_ACTION_DIM=32
+ARM_ENABLE_COUNT=1
+CAN_WRITE_COUNT=3
+COMMAND_SEND_COUNT=0
+SAFETY_REJECT_COUNT=1
+STOP_REASON=STALE_DATA_HOLD
+RUN_STATUS=FAIL
+TASK_COMPLETE=NO
+```
 
-## Project outcome
+The model loaded and camera/feedback preflight passed. The runner entered `REAL_RUN`, but the freshness gate stopped execution before any policy joint command was sent. `CAN_WRITE_COUNT=3` includes enable/stop control writes and does not mean a policy rollout succeeded.
 
-The final real-run attempt did **not** complete the policy task. Preflight,
-camera probe, feedback probe, and checkpoint load passed, but the runner held
-on stale data before sending any policy joint command. The exact final status
-is recorded in `PROJECT_FINAL_STATUS.md`.
+A cold-start JAX inference delay was observed. `FIRST_TARGET_TIMEOUT_SECONDS=20.0` was added, while the runtime freshness threshold remained `STALE_AFTER_SECONDS=0.50`. A proposal to warm up inference, discard that result, reacquire fresh camera and CAN state, and then enter runtime was **PROPOSED_NOT_IMPLEMENTED**. The project was archived at that point.
 
-Upstream copyright and license notices remain in `LICENSE`,
-`LICENSE_GEMMA.txt`, and `THIRD_PARTY_NOTICE.md`.
+## Safety boundary
+
+The archived code retains physical hard limits, gripper limits, raw policy-output rejection, safety aborts, executor re-checks, a maximum 1 degree/tick for J1–J6, and camera/state/target freshness checks. Offline evaluation observed a positive J3 overshoot tendency; these checks must not be removed to make a run proceed.
+
+Any command that can open a device, enable an arm, write CAN, or start a camera is an operator-reviewed template only. Replace placeholders locally and perform an independent safety review first.
+
+## Provenance
+
+The project-specific additions are layered on upstream OpenPI/LeRobot interfaces and Piper/Feetech/RealSense SDK boundaries. See `THIRD_PARTY_NOTICE.md`, `FILES_MANIFEST.md`, and `provenance/source_revisions.txt`. The archive is selective and may require a compatible upstream OpenPI tree: `REQUIRES_UPSTREAM_OPENPI_TREE`.

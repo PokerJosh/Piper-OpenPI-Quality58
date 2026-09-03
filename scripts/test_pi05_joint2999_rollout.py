@@ -704,11 +704,11 @@ def test_preflight_invokes_camera_feedback_and_driver_health_probes(
     assert dependencies.camera_probe_count == 1
     assert dependencies.feedback_probe_count == 1
     assert report["CAMERA_PROBE"] == "PASS"
-    assert report["CAMERA_TOP"]["resolved_identity"].startswith(str(Path("/dev") / "v4l" / "by-id") + "/")
+    assert report["CAMERA_TOP"]["resolved_identity"].startswith("/dev/v4l/by-id/")
     assert report["CAMERA_TOP"]["actual_shape"] == {"width": 640, "height": 480, "channels": 3}
     assert report["CAMERA_TOP"]["freshness_contract"] == "bounded_host_receipt_sequence_liveness"
     assert report["CAMERA_TOP"]["timestamp_source"] == "host_receipt_monotonic_not_sensor_capture_time"
-    assert report["CAMERA_WRIST"]["resolved_identity"] == "<REDACTED>"
+    assert report["CAMERA_WRIST"]["resolved_identity"] == "<WRIST_CAMERA_SERIAL>"
     assert report["CAMERA_WRIST"]["actual_shape"] == {"width": 640, "height": 480, "channels": 3}
     assert report["FEEDBACK_PROBE"] == "PASS"
     assert report["PIPER_CONNECTION"] == "READ_ONLY_PASS"
@@ -988,7 +988,7 @@ def test_quality58_h20_final_checkpoint_runner_contract():
     from openpi.training import config as training_config
 
     expected_checkpoint = Path(
-        "<CHECKPOINT_ROOT>/"
+        "<CHECKPOINT_ROOT>/checkpoints/"
         "pi05_piper_joint_rtc_h20_quality58_finetune/"
         "pi05_piper_joint_rtc_h20_quality58_3k_20260902_135854/2999"
     )

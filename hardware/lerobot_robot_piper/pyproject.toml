@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_robot_piper"
+version = "0.1.1"
+description = "LeRobot robot plugin for AgileX Piper arm"
+requires-python = ">=3.10"
+dependencies = [
+    "lerobot",
+    "piper_sdk",
+    "python-can",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]

@@ -7,7 +7,7 @@ top:
   fps: 30
 wrist:
   kind: intelrealsense
-  serial: "<REDACTED>"
+  serial: "<WRIST_CAMERA_SERIAL>"
   width: 640
   height: 480
   fps: 30

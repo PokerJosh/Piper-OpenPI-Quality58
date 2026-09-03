@@ -1,0 +1,23 @@
+uarm_feetech_reader:
+  ros__parameters:
+    port: <LEADER_SERIAL_PORT>
+    baudrate: 1000000
+    servo_ids: [1, 2, 3, 4, 5, 6, 7]
+    joint_names:
+      - uarm_joint1
+      - uarm_joint2
+      - uarm_joint3
+      - uarm_joint4
+      - uarm_joint5
+      - uarm_joint6
+      - uarm_gripper
+    read_rate_hz: 30.0
+    ticks_per_revolution: 4096.0
+    position_offset_ticks: [2047, 2047, 2047, 2047, 2047, 2047, 2047]
+    position_signs: [-1.0, -1.0, -1.0, -1.0, 1.0, -1.0, -1.0]
+    publish_partial_reads: false
+    hold_last_on_read_error: true
+    max_tick_jump: 120
+    warn_every_s: 2.0
+    log_raw_every_s: 2.0
+    scservo_sdk_path: <PIPER_PROJECT_ROOT>/hardware/piper_leader_kit/sdk

@@ -1,46 +1,30 @@
 # Reproducibility
 
-This archive intentionally contains code and metadata, not the source data or
-model weights.
+This repository is a selective engineering archive, not a replacement for the upstream OpenPI or LeRobot source tree. It preserves project-specific code, templates, tests, procedures, and final status while omitting real payloads.
 
-## Required external inputs
+## External inputs
 
-Provide these values in the local environment or in a private, local copy of
-the relevant configuration before running an offline operation:
+Supply these values only in a local working copy or environment:
 
-- `<OPENPI_ROOT>`: a compatible upstream OpenPI checkout.
-- `<CHECKPOINT_ROOT>`: the separately retained checkpoint root, if a load-only
-  or offline evaluator is approved.
-- `<NOMINAL_DATASET_ROOT>`: the nominal Piper Joint dataset.
-- `<RECOVERY_DATASET_ROOT>`: the reviewed recovery Piper Joint dataset.
-- `<DATA_QA_ROOT>`: the final training manifest and sample mask directory.
-- `<TOP_CAMERA_DEVICE_PATH>` and a local wrist-camera serial: only for a
-  separately approved hardware operation. Hardware is outside this archive.
+- `<OPENPI_ROOT>`: compatible upstream OpenPI checkout.
+- `<PIPER_PROJECT_ROOT>`: local checkout containing the hardware/recording integration.
+- `<CAN_INTERFACE>`: local Piper CAN interface.
+- `<LEADER_SERIAL_PORT>`: local Feetech leader serial port.
+- `<TOP_CAMERA_DEVICE_PATH>` and `<TOP_CAMERA_SERIAL>`: local top-camera identity.
+- `<WRIST_CAMERA_SERIAL>`: local wrist-camera identity.
+- `<DATASET_ROOT>`: local raw/reviewed/conversion data root.
+- `<NOMINAL_DATASET_ROOT>` and `<RECOVERY_DATASET_ROOT>`: local source datasets.
+- `<CHECKPOINT_ROOT>`: separately retained checkpoint root.
+- `<DATA_QA_ROOT>`: local manifest and mask directory.
 
-The archived files use placeholders instead of machine-specific values. They
-are reference snapshots and are not intended to silently discover devices or
-local files.
+Do not commit replacements for these placeholders.
 
-## Frozen training facts
+## Quality58 freeze
 
-- 47 nominal episodes and 11 recovery episodes.
-- 58 total episodes.
-- 25,336 legal H20 windows.
-- H20 action horizon.
-- 7 physical action dimensions, with 32 model action dimensions.
-- Training-time RTC maximum delay 4.
-- 3,000 training steps; final logical checkpoint step 2,999.
+The final training selection was 47 nominal episodes plus 11 recovery episodes, 58 total, yielding 25,336 valid H20 windows. The model used physical action dimension 7, latent/model action dimension 32, and action horizon 20. Training ran for 3,000 steps, with logical final checkpoint step 2,999.
 
-The metadata-only examples under `examples/` preserve selection and window
-membership information without copying episode data.
+The frozen manifest and sample mask are metadata concepts only in this repository. The episode files, videos, and source dataset roots are not included.
 
-## Safe validation boundary
+## Validation boundary
 
-Allowed archive validation is static compilation and small CPU/offline unit
-tests only. Do not run camera probes, CAN operations, robot commands, model
-training, or long GPU evaluations as part of archive verification.
-
-Because this is a selective snapshot, tests that import omitted upstream
-modules require `REQUIRES_UPSTREAM_OPENPI_TREE`. Replace placeholders only in a
-working copy or through local environment/configuration; do not commit local
-hardware identifiers or private paths back into this archive.
+Permitted archive checks are Python compilation and bounded CPU/offline tests. Do not run camera probes, CAN operations, robot commands, training, or long GPU evaluation as part of archive verification. Some selective-snapshot tests require the omitted upstream tree and should be reported as `REQUIRES_UPSTREAM_OPENPI_TREE` rather than solved by copying the entire upstream project.

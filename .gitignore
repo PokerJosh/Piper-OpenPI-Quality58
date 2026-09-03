@@ -42,3 +42,10 @@ artifacts/*log*
 .DS_Store
 .vscode/
 .idea/
+# Archive-only hardware/data payload exclusions
+hardware/**/calibration/*_log.json
+recording/**/episode_*
+*.bag
+*.raw
+*.pcap
+*.db

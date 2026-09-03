@@ -1,0 +1,19 @@
+piper_virtual_mapper:
+  ros__parameters:
+    input_topic: /uarm/raw_servo_positions
+    output_topic: /joint_states
+    publish_debug_topic: false
+    mapping_file: <PIPER_PROJECT_ROOT>/hardware/piper_leader_kit/config/leader_to_piper_mapping.json
+    out_of_range_policy: clamp
+    smoothing_alpha: 0.35
+    max_joint_step_rad: 0.12
+    require_all_servos: true
+    student_joint_names:
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - joint5
+      - joint6
+      - joint7
+      - joint8

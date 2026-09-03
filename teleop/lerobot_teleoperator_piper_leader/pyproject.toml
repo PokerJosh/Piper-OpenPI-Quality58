@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_teleoperator_piper_leader"
+version = "0.1.0"
+description = "LeRobot teleoperator plugin for Piper leader arm (Feetech serial + piper_leader_kit mapping)"
+requires-python = ">=3.10"
+dependencies = [
+    "lerobot",
+    "pyserial>=3.5",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]

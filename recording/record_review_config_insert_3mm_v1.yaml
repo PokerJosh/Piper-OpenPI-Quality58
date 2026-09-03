@@ -1,0 +1,24 @@
+fps: 30
+auto_trim:
+  enabled: true
+  action_joint_threshold_deg: 0.15
+  state_joint_threshold_deg: 0.10
+  action_gripper_threshold_m: 0.0004
+  state_gripper_threshold_m: 0.0003
+  active_consecutive_frames: 3
+  pre_roll_frames: 10
+  post_roll_frames: 15
+review:
+  default_speed: 1.0
+recording:
+  auto_approve_after_stop: false
+  auto_trim_on_accept: true
+  raw_root: <DATASET_ROOT>/piper_insert_3mm_review
+  reviewed_root: <DATASET_ROOT>/piper_insert_3mm_review_reviewed
+  collection_stage: ARCHIVE_TEMPLATE
+replay:
+  default_speed: 0.5
+  max_joint_step_deg: 5.0
+  max_start_pose_error_deg: 5.0
+  gripper_min_m: 0.0
+  gripper_max_m: 0.07

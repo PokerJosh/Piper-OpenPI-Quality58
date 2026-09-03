@@ -1,0 +1,211 @@
+{
+  "schema": "leader_to_piper_v1",
+  "updated_at": "<UTC_TIMESTAMP>",
+  "kit_version": "1.0.0",
+  "encoder": {
+    "ticks_per_revolution": 4096,
+    "center_ticks": 2047,
+    "wrap_ticks": 4096,
+    "angle_rad_formula": "direction * (raw_ticks - teacher_zero) / ticks_per_revolution * 2*pi"
+  },
+  "calibration": {
+    "source": "leader_zero_result.example.json",
+    "mode": "offset",
+    "note": "校准后各舵机零位读数为 2047；teacher_zero 统一取 center_ticks",
+    "servo_zero_ticks": {
+      "1": 2047,
+      "2": 2047,
+      "3": 2047,
+      "4": 2047,
+      "5": 2047,
+      "6": 2047,
+      "7": 2047
+    },
+    "eeprom_offset_at_calib": {
+      "1": "<REDACTED>",
+      "2": "<REDACTED>",
+      "3": "<REDACTED>",
+      "4": "<REDACTED>",
+      "5": "<REDACTED>",
+      "6": "<REDACTED>",
+      "7": "<REDACTED>"
+    }
+  },
+  "axis_table": [
+    {
+      "piper_joint": "joint1",
+      "teacher_id": 1,
+      "direction": -1,
+      "student_limit_rad": [
+        -2.618,
+        2.168
+      ]
+    },
+    {
+      "piper_joint": "joint2",
+      "teacher_id": 2,
+      "direction": -1,
+      "student_limit_rad": [
+        0.0,
+        3.14
+      ]
+    },
+    {
+      "piper_joint": "joint3",
+      "teacher_id": 3,
+      "direction": -1,
+      "student_limit_rad": [
+        -2.967,
+        0.0
+      ]
+    },
+    {
+      "piper_joint": "joint4",
+      "teacher_id": 4,
+      "direction": -1,
+      "student_limit_rad": [
+        -1.745,
+        1.745
+      ]
+    },
+    {
+      "piper_joint": "joint5",
+      "teacher_id": 5,
+      "direction": 1,
+      "student_limit_rad": [
+        -1.22,
+        1.22
+      ]
+    },
+    {
+      "piper_joint": "joint6",
+      "teacher_id": 6,
+      "direction": -1,
+      "student_limit_rad": [
+        -2.0944,
+        2.0944
+      ]
+    },
+    {
+      "piper_joint": "joint7",
+      "teacher_id": 7,
+      "direction": -1,
+      "student_limit_rad": [
+        0.0,
+        0.07
+      ],
+      "unit": "m",
+      "role": "gripper_opening"
+    }
+  ],
+  "out_of_range_policy": "clamp",
+  "out_of_range_policies": {
+    "clamp": "超出主臂行程或从臂弧度限位时，输出钳制到边界（RViz 保持在限位）",
+    "reject": "超出主臂行程时，该关节保持上一帧从臂位置（不跟随）"
+  },
+  "joint_maps": [
+    {
+      "teacher_id": 1,
+      "student_joint": "joint1",
+      "direction": -1.0,
+      "mode": "delta",
+      "teacher_zero": 2047.0,
+      "teacher_min": "<REDACTED>",
+      "teacher_max": "<REDACTED>",
+      "teacher_scale_ticks": "<REDACTED>",
+      "teacher_wrap_ticks": 4096.0,
+      "student_zero": 0.0,
+      "student_min": -2.618,
+      "student_max": 2.168
+    },
+    {
+      "teacher_id": 2,
+      "student_joint": "joint2",
+      "direction": -1.0,
+      "mode": "delta",
+      "teacher_zero": 2047.0,
+      "teacher_min": "<REDACTED>",
+      "teacher_max": "<REDACTED>",
+      "teacher_scale_ticks": "<REDACTED>",
+      "teacher_wrap_ticks": 4096.0,
+      "student_zero": 0.0,
+      "student_min": 0.0,
+      "student_max": 3.14
+    },
+    {
+      "teacher_id": 3,
+      "student_joint": "joint3",
+      "direction": -1.0,
+      "mode": "delta",
+      "teacher_zero": 2047.0,
+      "teacher_min": "<REDACTED>",
+      "teacher_max": "<REDACTED>",
+      "teacher_scale_ticks": "<REDACTED>",
+      "teacher_wrap_ticks": 4096.0,
+      "student_zero": 0.0,
+      "student_min": -2.967,
+      "student_max": 0.0
+    },
+    {
+      "teacher_id": 4,
+      "student_joint": "joint4",
+      "direction": -1.0,
+      "mode": "delta",
+      "teacher_zero": 2047.0,
+      "teacher_min": "<REDACTED>",
+      "teacher_max": "<REDACTED>",
+      "teacher_scale_ticks": "<REDACTED>",
+      "teacher_wrap_ticks": 4096.0,
+      "student_zero": 0.0,
+      "student_min": -1.745,
+      "student_max": 1.745
+    },
+    {
+      "teacher_id": 5,
+      "student_joint": "joint5",
+      "direction": 1.0,
+      "mode": "delta",
+      "teacher_zero": 2047.0,
+      "teacher_min": "<REDACTED>",
+      "teacher_max": "<REDACTED>",
+      "teacher_scale_ticks": "<REDACTED>",
+      "teacher_wrap_ticks": 4096.0,
+      "student_zero": 0.0,
+      "student_min": -1.22,
+      "student_max": 1.22
+    },
+    {
+      "teacher_id": 6,
+      "student_joint": "joint6",
+      "direction": -1.0,
+      "mode": "delta",
+      "teacher_zero": 2047.0,
+      "teacher_min": "<REDACTED>",
+      "teacher_max": "<REDACTED>",
+      "teacher_scale_ticks": "<REDACTED>",
+      "teacher_wrap_ticks": 4096.0,
+      "student_zero": 0.0,
+      "student_min": -2.0944,
+      "student_max": 2.0944
+    }
+  ],
+  "gripper_map": {
+    "teacher_id": 7,
+    "direction": -1.0,
+    "teacher_zero": 2047.0,
+    "teacher_min": 1186.0,
+    "teacher_max": 2048.0,
+    "teacher_scale_ticks": 861.0,
+    "teacher_wrap_ticks": 4096.0,
+    "opening_zero": 0.0,
+    "opening_min": 0.0,
+    "opening_max": 0.07,
+    "joint7": "joint7",
+    "joint8": "joint8"
+  },
+  "notes": [
+    "Sanitized example only; generate private calibration values on the target leader hardware.",
+    "teacher_zero=2047 and encoder semantics are retained; teacher range/scale values are redacted.",
+    "J1..J6 map to Piper joint degrees at the LeRobot boundary; gripper is metres."
+  ]
+}

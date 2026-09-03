@@ -1,0 +1,9 @@
+# Local-only path template. Replace placeholders outside this archive.
+kit_root: <PIPER_PROJECT_ROOT>/hardware/piper_leader_kit
+mapping_file: <PIPER_PROJECT_ROOT>/calibration/leader_to_piper_mapping.example.json
+mapper_config: <PIPER_PROJECT_ROOT>/calibration/config/leader_to_piper_mapper.example.yaml
+reader_config: <PIPER_PROJECT_ROOT>/calibration/config/leader_feetech_reader.example.yaml
+calibration_result: <PIPER_PROJECT_ROOT>/calibration/leader_zero_result.example.json
+ros_package: uarm_piper_teleop
+ros_workspace: <ROS_WORKSPACE>
+piper_urdf: <PIPER_URDF_PATH>

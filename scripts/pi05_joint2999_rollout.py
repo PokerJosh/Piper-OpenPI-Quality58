@@ -39,7 +39,7 @@ FIRST_TARGET_TIMEOUT_SECONDS = 20.0
 DRIVER_SPEED_CAP_DEG_S = 50.0
 CONFIG_NAME = "pi05_piper_joint_rtc_h20_quality58_finetune"
 CHECKPOINT = Path(
-    "<CHECKPOINT_ROOT>/pi05_piper_joint_rtc_h20_quality58_finetune/"
+    "<CHECKPOINT_ROOT>/checkpoints/pi05_piper_joint_rtc_h20_quality58_finetune/"
     "pi05_piper_joint_rtc_h20_quality58_3k_20260902_135854/2999"
 )
 PROMPT = "pick up the battery and place it into the target location"

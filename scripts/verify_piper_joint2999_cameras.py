@@ -15,8 +15,8 @@ import numpy as np
 import yaml
 
 
-TOP_PATH = "<TOP_CAMERA_DEVICE_PATH>"
-WRIST_SERIAL = "<REDACTED>"
+TOP_PATH = "/dev/v4l/by-id/usb-ZJ-240719-ZW_Hy_RGB_Came_01.00.00-video-index0"
+WRIST_SERIAL = "<WRIST_CAMERA_SERIAL>"
 FRAME_STALE_AFTER_SECONDS = 2.0
 HOST_RECEIPT_SEQUENCE_CONTRACT = "bounded_host_receipt_sequence_liveness"
 HOST_RECEIPT_TIMESTAMP_KIND = "host_receipt_monotonic_not_sensor_capture_time"

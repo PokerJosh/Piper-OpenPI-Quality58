@@ -23,7 +23,7 @@ from scripts.verify_piper_joint2999_cameras import verify_manifest_shape
 
 VALID_TOP = {
     "kind": "opencv",
-    "path": "<TOP_CAMERA_DEVICE_PATH>",
+    "path": "/dev/v4l/by-id/usb-ZJ-240719-ZW_Hy_RGB_Came_01.00.00-video-index0",
     "fourcc": "MJPG",
     "width": 640,
     "height": 480,
@@ -31,7 +31,7 @@ VALID_TOP = {
 }
 VALID_WRIST = {
     "kind": "intelrealsense",
-    "serial": "<REDACTED>",
+    "serial": "<WRIST_CAMERA_SERIAL>",
     "width": 640,
     "height": 480,
     "fps": 30,
@@ -43,12 +43,12 @@ def test_manifest_declares_stable_top_and_current_wrist_identity():
     verify_manifest_shape(manifest)
     assert manifest["top"]["path"].endswith("video-index0")
     assert manifest["top"]["fourcc"] == "MJPG"
-    assert manifest["wrist"]["serial"] == "<REDACTED>"
+    assert manifest["wrist"]["serial"] == "<WRIST_CAMERA_SERIAL>"
 
 
 def test_manifest_rejects_stale_wrist_serial():
-    with pytest.raises(ValueError, match="<REDACTED>"):
-        verify_manifest_shape({"top": VALID_TOP, "wrist": {**VALID_WRIST, "serial": "<REDACTED>"}})
+    with pytest.raises(ValueError, match="<WRIST_CAMERA_SERIAL>"):
+        verify_manifest_shape({"top": VALID_TOP, "wrist": {**VALID_WRIST, "serial": "<TOP_CAMERA_SERIAL>"}})
 
 
 def test_frame_report_rejects_old_monotonic_source_timestamp():
